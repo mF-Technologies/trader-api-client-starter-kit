@@ -1,0 +1,50 @@
+[build-system]
+requires = ["hatchling>=1.27,<2"]
+build-backend = "hatchling.build"
+
+[project]
+name = "trader-api-examples"
+version = "0.1.0"
+description = "Runnable reference tools and guarded algo examples for the mFT Trader API."
+readme = "README.md"
+requires-python = ">=3.12,<3.15"
+dependencies = [
+  "httpx>=0.28,<1",
+  "numpy>=2.0,<3",
+  "PyYAML>=6.0,<7",
+  "TA-Lib==0.7.1",
+]
+
+[project.optional-dependencies]
+prices = ["fxserverclientpython==0.1.10"]
+dev = [
+  "detect-secrets>=1.5,<2",
+  "mypy>=1.15,<2",
+  "pytest>=8.3,<9",
+  "pytest-asyncio>=0.25,<1",
+  "ruff>=0.11,<1",
+  "types-PyYAML>=6.0,<7",
+]
+
+[project.scripts]
+trader-api-examples = "trader_api_examples.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/trader_api_examples"]
+
+[tool.pytest.ini_options]
+addopts = "-q"
+testpaths = ["tests"]
+asyncio_mode = "auto"
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+packages = ["trader_api_examples"]
