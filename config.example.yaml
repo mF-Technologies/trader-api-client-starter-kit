@@ -1,0 +1,22 @@
+environment: demo
+
+endpoints:
+  web_proxy_url: https://webproxy.example
+  fxserver_rest_url: https://fxserver.example
+  chart_server_url: https://chart.example
+  fxserver_ws_url: wss://fxserver.example/websocket
+  price_agent_ws_url: wss://price-agent.example/websocket
+
+trading:
+  contract: EURUSD
+  amount: 1000
+  max_runtime_seconds: 600
+  poll_seconds: 5
+  bar_count: 200
+
+strategy:
+  period_type: 1
+  rsi_period: 14
+  oversold: 30
+  overbought: 70
+  exit_level: 50
