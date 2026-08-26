@@ -1,5 +1,6 @@
 .venv/
 .env
+.env.local
 config.local.yaml
 runtime/
 artifacts/

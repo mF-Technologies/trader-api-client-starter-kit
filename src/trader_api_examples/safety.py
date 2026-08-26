@@ -20,9 +20,8 @@ class JournalState(StrEnum):
     OWNERSHIP_UNCONFIRMED = "OWNERSHIP_UNCONFIRMED"
 
 
-def assert_live_execution_enabled(*, execute: bool) -> None:
-    env_enabled = os.getenv("TRADER_API_ENABLE_LIVE_TRADING", "").strip().lower()
-    if env_enabled != "true" or not execute:
+def assert_live_execution_enabled(*, enabled: bool, execute: bool) -> None:
+    if not enabled or not execute:
         raise LiveExecutionBlocked(
             "Live execution requires TRADER_API_ENABLE_LIVE_TRADING=true and --execute."
         )

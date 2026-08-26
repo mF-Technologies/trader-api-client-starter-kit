@@ -10,18 +10,14 @@ from trader_api_examples.safety import (
 )
 
 
-def test_live_execution_requires_environment_gate_and_execute_flag(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.delenv("TRADER_API_ENABLE_LIVE_TRADING", raising=False)
+def test_live_execution_requires_environment_gate_and_execute_flag() -> None:
     with pytest.raises(LiveExecutionBlocked):
-        assert_live_execution_enabled(execute=True)
+        assert_live_execution_enabled(enabled=False, execute=True)
 
-    monkeypatch.setenv("TRADER_API_ENABLE_LIVE_TRADING", "true")
     with pytest.raises(LiveExecutionBlocked):
-        assert_live_execution_enabled(execute=False)
+        assert_live_execution_enabled(enabled=True, execute=False)
 
-    assert_live_execution_enabled(execute=True)
+    assert_live_execution_enabled(enabled=True, execute=True)
 
 
 def test_journal_records_submission_intent_before_order_reference(tmp_path: Path) -> None:

@@ -31,11 +31,13 @@ class ExecutionManager:
         *,
         client: ExecutionClient,
         journal_path: Path,
+        live_trading_enabled: bool,
         poll_seconds: float = 1.0,
         confirmation_attempts: int = 10,
     ) -> None:
         self.client = client
         self.journal_path = journal_path
+        self.live_trading_enabled = live_trading_enabled
         self.poll_seconds = poll_seconds
         self.confirmation_attempts = confirmation_attempts
 
@@ -49,7 +51,7 @@ class ExecutionManager:
         buy: bool,
         client_order_id: int,
     ) -> Journal:
-        assert_live_execution_enabled(execute=execute)
+        assert_live_execution_enabled(enabled=self.live_trading_enabled, execute=execute)
         journal = Journal.begin_submission(
             path=self.journal_path,
             run_id=str(uuid4()),
@@ -76,7 +78,7 @@ class ExecutionManager:
         return journal
 
     async def cleanup(self, *, journal: Journal, execute: bool, client_order_id: int) -> str:
-        assert_live_execution_enabled(execute=execute)
+        assert_live_execution_enabled(enabled=self.live_trading_enabled, execute=execute)
         order_ref = journal.order_ref
         if not order_ref:
             journal.with_state(JournalState.OWNERSHIP_UNCONFIRMED)

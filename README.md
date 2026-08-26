@@ -24,11 +24,13 @@ py -3.12 -m venv .venv
 .\.venv\Scripts\Activate.ps1
 python -m pip install -e ".[dev,prices]" --extra-index-url https://mf-technologies.github.io/Python-package-repositories/simple/
 Copy-Item config.example.yaml config.local.yaml
-Copy-Item .env.example .env
+Copy-Item .env.local.example .env.local
 ```
 
-Load the values from `.env` into your shell or secret manager. The application reads
-credentials only from environment variables; it does not parse `.env` automatically.
+Set the demo endpoints and instrument settings in `config.local.yaml`, then add credentials
+to `.env.local`. The application automatically reads `.env.local` from the same directory
+as the selected configuration file. Existing process environment variables take precedence.
+Both local files are ignored by Git.
 
 ## Commands
 

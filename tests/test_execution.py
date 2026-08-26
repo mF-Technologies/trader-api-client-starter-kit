@@ -31,12 +31,16 @@ class FakeExecutionClient:
 
 @pytest.mark.asyncio
 async def test_execution_writes_intent_then_confirms_and_cleans_up(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path,
 ) -> None:
-    monkeypatch.setenv("TRADER_API_ENABLE_LIVE_TRADING", "true")
     journal_path = tmp_path / "execution.json"
     client = FakeExecutionClient(journal_path)
-    manager = ExecutionManager(client=client, journal_path=journal_path, poll_seconds=0)
+    manager = ExecutionManager(
+        client=client,
+        journal_path=journal_path,
+        live_trading_enabled=True,
+        poll_seconds=0,
+    )
 
     journal = await manager.open_position(
         execute=True,

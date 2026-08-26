@@ -185,7 +185,7 @@ def replay_algo(config: AppConfig, fixture: Path | None) -> CommandResult:
 
 
 async def order_lifecycle(config: AppConfig, execute: bool) -> CommandResult:
-    assert_live_execution_enabled(execute=execute)
+    assert_live_execution_enabled(enabled=config.live_trading_enabled, execute=execute)
     fingerprint = account_fingerprint(config.secrets.api_key)
     journal_path = _journal_path(config)
     journal: Journal | None = None
@@ -194,7 +194,11 @@ async def order_lifecycle(config: AppConfig, execute: bool) -> CommandResult:
             await client.get_contract_settings(), config.trading.contract
         )
         validate_amount(amount=config.trading.amount, contract_setting=setting)
-        manager = ExecutionManager(client=client, journal_path=journal_path)
+        manager = ExecutionManager(
+            client=client,
+            journal_path=journal_path,
+            live_trading_enabled=config.live_trading_enabled,
+        )
         _write_execution_summary(config, fingerprint, "BUY")
         try:
             journal = await manager.open_position(
@@ -243,7 +247,7 @@ def _latest_is_stale(bars: list[Bar], config: AppConfig) -> bool:
 
 async def live_algo(config: AppConfig, mode: str, execute: bool) -> CommandResult:
     if mode == "live-execute":
-        assert_live_execution_enabled(execute=execute)
+        assert_live_execution_enabled(enabled=config.live_trading_enabled, execute=execute)
     deadline = asyncio.get_running_loop().time() + config.trading.max_runtime_seconds
     fingerprint = account_fingerprint(config.secrets.api_key)
     manager: ExecutionManager | None = None
@@ -257,7 +261,11 @@ async def live_algo(config: AppConfig, mode: str, execute: bool) -> CommandResul
         )
         validate_amount(amount=config.trading.amount, contract_setting=setting)
         if mode == "live-execute":
-            manager = ExecutionManager(client=client, journal_path=_journal_path(config))
+            manager = ExecutionManager(
+                client=client,
+                journal_path=_journal_path(config),
+                live_trading_enabled=config.live_trading_enabled,
+            )
             unrelated_position_count = len(await client.get_positions())
             if unrelated_position_count:
                 print(
@@ -411,7 +419,11 @@ async def recover(config: AppConfig, execute: bool) -> CommandResult:
                 "Tracked position remains open; rerun recovery with both execution gates.",
                 {"order_ref": journal.order_ref},
             )
-        manager = ExecutionManager(client=client, journal_path=path)
+        manager = ExecutionManager(
+            client=client,
+            journal_path=path,
+            live_trading_enabled=config.live_trading_enabled,
+        )
         cleanup_ref = await manager.cleanup(
             journal=journal, execute=True, client_order_id=_client_order_id()
         )
