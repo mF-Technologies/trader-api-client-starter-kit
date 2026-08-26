@@ -39,6 +39,54 @@ strategy:
     assert config.secrets.api_key == "secret-api-key"  # pragma: allowlist secret
 
 
+def test_load_config_reads_dotenv_local_next_to_config(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config_path = tmp_path / "config.local.yaml"
+    config_path.write_text("environment: demo\n", encoding="utf-8")
+    (tmp_path / ".env.local").write_text(
+        "\n".join(
+            (
+                "TRADER_API_KEY=local-api-key",  # pragma: allowlist secret
+                "TRADER_API_USERNAME=local-user",
+                "TRADER_API_TRADE_KEY=local-trade-key",  # pragma: allowlist secret
+                "TRADER_API_ENABLE_LIVE_TRADING=true",
+            )
+        ),
+        encoding="utf-8",
+    )
+    for name in (
+        "TRADER_API_KEY",
+        "TRADER_API_USERNAME",
+        "TRADER_API_TRADE_KEY",
+        "TRADER_API_ENABLE_LIVE_TRADING",
+    ):
+        monkeypatch.delenv(name, raising=False)
+
+    config = load_config(config_path)
+
+    assert config.secrets.api_key == "local-api-key"  # pragma: allowlist secret
+    assert config.secrets.username == "local-user"
+    assert config.secrets.trade_key == "local-trade-key"  # pragma: allowlist secret
+    assert config.live_trading_enabled is True
+
+
+def test_environment_variables_override_dotenv_local(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config_path = tmp_path / "config.local.yaml"
+    config_path.write_text("environment: demo\n", encoding="utf-8")
+    (tmp_path / ".env.local").write_text(
+        "TRADER_API_KEY=local-api-key\n",  # pragma: allowlist secret
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("TRADER_API_KEY", "environment-api-key")  # pragma: allowlist secret
+
+    config = load_config(config_path)
+
+    assert config.secrets.api_key == "environment-api-key"  # pragma: allowlist secret
+
+
 @pytest.mark.parametrize("field", ["api_key", "token", "password", "username", "trade_key"])
 def test_load_config_rejects_sensitive_fields_anywhere(tmp_path: Path, field: str) -> None:
     config_path = tmp_path / "unsafe.yaml"

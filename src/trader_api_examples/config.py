@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any
 
 import yaml
+from dotenv import dotenv_values
 
 
 class ConfigError(ValueError):
@@ -64,6 +65,7 @@ class AppConfig:
     trading: TradingConfig = field(default_factory=TradingConfig)
     strategy: StrategyConfig = field(default_factory=StrategyConfig)
     secrets: Secrets = field(default_factory=lambda: Secrets(api_key=""))
+    live_trading_enabled: bool = False
 
 
 def _reject_sensitive_fields(value: Any, path: str = "config") -> None:
@@ -86,6 +88,11 @@ def _mapping(value: Any, name: str) -> dict[str, Any]:
     return {str(key): item for key, item in value.items()}
 
 
+def _environment_value(local: dict[str, str | None], name: str) -> str:
+    value = os.environ[name] if name in os.environ else local.get(name)
+    return (value or "").strip()
+
+
 def load_config(path: Path, *, require_api_key: bool = True) -> AppConfig:
     try:
         raw = yaml.safe_load(path.read_text(encoding="utf-8"))
@@ -97,7 +104,8 @@ def load_config(path: Path, *, require_api_key: bool = True) -> AppConfig:
     data = _mapping(raw, "config")
     _reject_sensitive_fields(data)
 
-    api_key = os.getenv("TRADER_API_KEY", "").strip()
+    local_environment = dict(dotenv_values(path.parent / ".env.local", encoding="utf-8"))
+    api_key = _environment_value(local_environment, "TRADER_API_KEY")
     if require_api_key and not api_key:
         raise ConfigError("Required environment variable is not set: TRADER_API_KEY")
 
@@ -116,8 +124,12 @@ def load_config(path: Path, *, require_api_key: bool = True) -> AppConfig:
         strategy=StrategyConfig(**strategy),
         secrets=Secrets(
             api_key=api_key,
-            username=os.getenv("TRADER_API_USERNAME", "").strip(),
-            trade_key=os.getenv("TRADER_API_TRADE_KEY", "").strip(),
+            username=_environment_value(local_environment, "TRADER_API_USERNAME"),
+            trade_key=_environment_value(local_environment, "TRADER_API_TRADE_KEY"),
+        ),
+        live_trading_enabled=(
+            _environment_value(local_environment, "TRADER_API_ENABLE_LIVE_TRADING").lower()
+            == "true"
         ),
     )
     _validate_config(result)

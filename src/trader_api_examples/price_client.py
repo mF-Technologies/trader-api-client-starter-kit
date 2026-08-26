@@ -27,7 +27,7 @@ async def read_quote(config: AppConfig, timeout_seconds: float = 10) -> Quote:
     if missing:
         raise ConfigError("Price client settings are missing: " + ", ".join(missing))
     try:
-        from fxserverclientpython import FxServerClientLib  # type: ignore[import-not-found]
+        from fxserverclientpython import FxServerClientLib
     except ImportError as error:
         raise ConfigError(
             "Install the optional price client with trader-api-examples[prices]."
