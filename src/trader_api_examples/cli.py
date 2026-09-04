@@ -10,6 +10,7 @@ from .algo import Outcome
 from .api import ApiError
 from .commands import (
     account_inspector,
+    algo_runner,
     contract_calculator,
     live_algo,
     market_data_monitor,
@@ -28,6 +29,7 @@ COMMANDS = (
     "market-data-monitor",
     "order-lifecycle-checker",
     "rsi-algo-demo",
+    "algo-runner",
     "recover",
 )
 
@@ -51,6 +53,11 @@ def build_parser() -> argparse.ArgumentParser:
             )
             child.add_argument("--execute", action="store_true")
             child.add_argument("--fixture", type=Path)
+        if command == "algo-runner":
+            child.add_argument(
+                "--mode", choices=("live-observe", "live-execute"), default="live-observe"
+            )
+            child.add_argument("--execute", action="store_true")
         if command == "market-data-monitor":
             child.add_argument("--bars-only", action="store_true")
     return parser
@@ -93,6 +100,8 @@ def _run_command(args: argparse.Namespace, config: object) -> CommandResult:
         if args.mode == "replay":
             return replay_algo(config, args.fixture)
         return asyncio.run(live_algo(config, args.mode, args.execute))
+    if args.command == "algo-runner":
+        return asyncio.run(algo_runner(config, args.mode, args.execute))
     raise ValueError(f"Unknown command: {args.command}")
 
 

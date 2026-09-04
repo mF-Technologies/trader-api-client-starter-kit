@@ -6,17 +6,27 @@ import json
 import secrets
 import sys
 import time
+from dataclasses import dataclass, field
 from importlib.resources import files
 from pathlib import Path
 from typing import Any
 
-from .algo import AlgoResult, Outcome, evaluate_replay, latest_signal
+from .algo import (
+    AlgoResult,
+    Outcome,
+    SignalEvent,
+    evaluate_replay,
+    latest_signal,
+    latest_strategy_signal,
+    required_completed_bars,
+)
 from .api import PERIOD_DURATION, Bar, TraderApiClient
-from .config import AppConfig
+from .config import AlgoInstanceConfig, AppConfig
 from .contracts import calculate_amount, find_contract_setting, validate_amount
 from .execution import ExecutionManager
 from .output import CommandResult
-from .price_client import read_quote
+from .price_client import PriceStreamSession, Quote, read_quote
+from .runtime import HeartbeatWriter, instance_journal_path
 from .safety import (
     Journal,
     JournalState,
@@ -69,15 +79,33 @@ def _write_execution_summary(config: AppConfig, fingerprint: str, side: str) -> 
 
 
 def _event_data(result: AlgoResult) -> list[dict[str, Any]]:
-    return [
-        {
+    events: list[dict[str, Any]] = []
+    for event in result.events:
+        item: dict[str, Any] = {
             "time_ms": event.time_ms,
             "signal": event.signal.value,
-            "rsi": event.rsi,
+            "strategy": event.strategy,
+            "indicator_value": event.indicator_value,
             "close": event.close,
         }
-        for event in result.events
-    ]
+        if event.strategy == "rsi":
+            item["rsi"] = event.indicator_value
+        events.append(item)
+    return events
+
+
+@dataclass
+class _InstanceRuntime:
+    config: AlgoInstanceConfig
+    deadline: float
+    manager: ExecutionManager | None = None
+    journal: Journal | None = None
+    owned_side: PositionSide | None = None
+    last_bar_time: int = -1
+    last_quote: Quote | None = None
+    events: list[SignalEvent] = field(default_factory=list)
+    status: str = "starting"
+    completed: bool = False
 
 
 async def account_inspector(config: AppConfig) -> CommandResult:
@@ -381,55 +409,255 @@ async def live_algo(config: AppConfig, mode: str, execute: bool) -> CommandResul
     )
 
 
+def _runtime_data(state: _InstanceRuntime) -> dict[str, Any]:
+    quote = state.last_quote
+    return {
+        "contract": state.config.trading.contract,
+        "strategy": state.config.strategy.name,
+        "status": state.status,
+        "quote": (
+            {"bid": quote.bid, "ask": quote.ask, "tag_present": bool(quote.tag)} if quote else None
+        ),
+        "events": _event_data(AlgoResult(Outcome.SUCCESS, state.events, "")),
+    }
+
+
+def _latest_is_stale_for_period(bars: list[Bar], period_type: int) -> bool:
+    if not bars:
+        return True
+    duration = PERIOD_DURATION[period_type]
+    return time.time() - bars[-1].time_ms / 1000 > duration.total_seconds() * 2
+
+
+def _write_instance_execution_summary(
+    config: AppConfig,
+    state: _InstanceRuntime,
+    fingerprint: str,
+    event: SignalEvent,
+) -> None:
+    instance = state.config
+    side = "BUY" if event.signal is Signal.OPEN_BUY else "SELL"
+    print(
+        "Execution summary: "
+        f"account={fingerprint} environment={config.environment} instance={instance.name} "
+        f"contract={instance.trading.contract} side={side} amount={instance.trading.amount}",
+        file=sys.stderr,
+    )
+
+
+async def _cleanup_runtime_state(state: _InstanceRuntime, *, execute: bool) -> None:
+    if state.journal is None or state.manager is None:
+        return
+    await state.manager.cleanup(
+        journal=state.journal,
+        execute=execute,
+        client_order_id=_client_order_id(),
+    )
+    state.journal = None
+    state.owned_side = None
+
+
+async def algo_runner(config: AppConfig, mode: str, execute: bool) -> CommandResult:
+    if mode == "live-execute":
+        assert_live_execution_enabled(enabled=config.live_trading_enabled, execute=execute)
+    elif execute:
+        raise LiveExecutionBlocked("--execute is only valid with --mode live-execute.")
+
+    loop = asyncio.get_running_loop()
+    fingerprint = account_fingerprint(config.secrets.api_key)
+    states = [
+        _InstanceRuntime(
+            config=instance,
+            deadline=loop.time() + instance.trading.max_runtime_seconds,
+        )
+        for instance in config.algo_instances
+    ]
+    heartbeat = HeartbeatWriter()
+
+    async with make_client(config, require_chart=True) as client:
+        settings = await client.get_contract_settings()
+        for state in states:
+            setting = find_contract_setting(settings, state.config.trading.contract)
+            validate_amount(amount=state.config.trading.amount, contract_setting=setting)
+            if mode == "live-execute":
+                state.manager = ExecutionManager(
+                    client=client,
+                    journal_path=instance_journal_path(
+                        state.config.name, state.config.trading.contract
+                    ),
+                    live_trading_enabled=config.live_trading_enabled,
+                )
+
+        async with PriceStreamSession(config) as price_session:
+            try:
+                while any(not state.completed for state in states):
+                    for state in states:
+                        if state.completed:
+                            continue
+                        instance = state.config
+                        if loop.time() >= state.deadline:
+                            await _cleanup_runtime_state(state, execute=execute)
+                            state.status = "runtime-limit"
+                            state.completed = True
+                            continue
+
+                        state.last_quote = await price_session.get_quote(
+                            instance.trading.contract,
+                            timeout_seconds=max(1.0, min(10.0, instance.trading.poll_seconds * 2)),
+                        )
+                        state.status = "streaming"
+                        bars = await client.get_completed_bars(
+                            contract=instance.trading.contract,
+                            period_type=instance.strategy.period_type,
+                            count=instance.trading.bar_count,
+                        )
+                        if _latest_is_stale_for_period(bars, instance.strategy.period_type):
+                            state.status = "stale-bars"
+                            raise RuntimeError(
+                                f"Completed market data is stale or missing for {instance.name}."
+                            )
+                        if len(bars) < required_completed_bars(instance.strategy):
+                            state.status = "insufficient-bars"
+                            raise RuntimeError(f"Not enough completed bars for {instance.name}.")
+                        if bars[-1].time_ms == state.last_bar_time:
+                            continue
+                        state.last_bar_time = bars[-1].time_ms
+                        event = latest_strategy_signal(
+                            bars,
+                            strategy=instance.strategy,
+                            position_side=state.owned_side,
+                        )
+                        if event is None:
+                            state.status = "waiting-signal"
+                            continue
+                        state.events.append(event)
+                        if mode == "live-observe":
+                            state.status = "signal-observed"
+                            continue
+
+                        manager = state.manager
+                        if manager is None:
+                            raise RuntimeError("Execution manager was not initialized.")
+                        if event.signal in {Signal.OPEN_BUY, Signal.OPEN_SELL}:
+                            if state.owned_side is not None:
+                                continue
+                            _write_instance_execution_summary(config, state, fingerprint, event)
+                            state.journal = await manager.open_position(
+                                execute=execute,
+                                account_fingerprint=fingerprint,
+                                contract=instance.trading.contract,
+                                amount=instance.trading.amount,
+                                buy=event.signal is Signal.OPEN_BUY,
+                                client_order_id=_client_order_id(),
+                            )
+                            state.owned_side = (
+                                PositionSide.LONG
+                                if event.signal is Signal.OPEN_BUY
+                                else PositionSide.SHORT
+                            )
+                            state.status = "position-open"
+                        elif state.journal is not None:
+                            await manager.cleanup(
+                                journal=state.journal,
+                                execute=execute,
+                                client_order_id=_client_order_id(),
+                            )
+                            state.journal = None
+                            state.owned_side = None
+                            state.status = "round-trip-complete"
+                            state.completed = True
+
+                    heartbeat.write({state.config.name: state.status for state in states})
+                    active_polls = [
+                        state.config.trading.poll_seconds for state in states if not state.completed
+                    ]
+                    if active_polls:
+                        await asyncio.sleep(min(active_polls))
+            finally:
+                for state in states:
+                    if state.journal is not None:
+                        await _cleanup_runtime_state(state, execute=execute)
+                        state.status = "cleaned-up"
+                heartbeat.write({state.config.name: state.status for state in states})
+
+    has_events = any(state.events for state in states)
+    return CommandResult(
+        "algo-runner",
+        Outcome.SUCCESS if has_events else Outcome.NO_SIGNAL,
+        "Algo runner stopped at its configured runtime limit.",
+        {
+            "mode": mode,
+            "account_fingerprint": fingerprint,
+            "shared_price_session": True,
+            "instances": {state.config.name: _runtime_data(state) for state in states},
+        },
+    )
+
+
 async def recover(config: AppConfig, execute: bool) -> CommandResult:
-    path = _journal_path(config)
-    if not path.exists():
+    candidate_paths = [_journal_path(config)] + [
+        instance_journal_path(instance.name, instance.trading.contract)
+        for instance in config.algo_instances
+    ]
+    paths = list(dict.fromkeys(path for path in candidate_paths if path.exists()))
+    if not paths:
         return CommandResult(
             "recover", Outcome.SUCCESS, "No unresolved execution journal exists.", {}
         )
-    journal = Journal.load(path)
     fingerprint = account_fingerprint(config.secrets.api_key)
-    if journal.account_fingerprint != fingerprint:
-        raise LiveExecutionBlocked("Recovery journal belongs to a different account fingerprint.")
-    if not journal.order_ref:
-        journal.with_state(JournalState.OWNERSHIP_UNCONFIRMED)
-        return CommandResult(
-            "recover",
-            Outcome.BLOCKED,
-            "Submission may have been accepted, but ownership cannot be confirmed automatically.",
-            {
-                "state": JournalState.OWNERSHIP_UNCONFIRMED.value,
-                "client_order_id": journal.client_order_id,
-            },
-        )
+    results: list[dict[str, Any]] = []
+    blocked = False
     async with make_client(config) as client:
-        position = await client.get_position_detail(journal.order_ref)
-        if position is None:
-            journal.clear()
-            return CommandResult(
-                "recover",
-                Outcome.SUCCESS,
-                "Tracked position is already closed; journal cleared.",
-                {},
+        for path in paths:
+            journal = Journal.load(path)
+            if journal.account_fingerprint != fingerprint:
+                raise LiveExecutionBlocked(
+                    "Recovery journal belongs to a different account fingerprint."
+                )
+            if not journal.order_ref:
+                journal.with_state(JournalState.OWNERSHIP_UNCONFIRMED)
+                blocked = True
+                results.append(
+                    {
+                        "journal": str(path),
+                        "state": JournalState.OWNERSHIP_UNCONFIRMED.value,
+                        "client_order_id": journal.client_order_id,
+                    }
+                )
+                continue
+            position = await client.get_position_detail(journal.order_ref)
+            if position is None:
+                journal.clear()
+                results.append({"journal": str(path), "state": "already-closed"})
+                continue
+            if not execute:
+                blocked = True
+                results.append(
+                    {
+                        "journal": str(path),
+                        "state": "open",
+                        "order_ref": journal.order_ref,
+                    }
+                )
+                continue
+            manager = ExecutionManager(
+                client=client,
+                journal_path=path,
+                live_trading_enabled=config.live_trading_enabled,
             )
-        if not execute:
-            return CommandResult(
-                "recover",
-                Outcome.BLOCKED,
-                "Tracked position remains open; rerun recovery with both execution gates.",
-                {"order_ref": journal.order_ref},
+            cleanup_ref = await manager.cleanup(
+                journal=journal, execute=True, client_order_id=_client_order_id()
             )
-        manager = ExecutionManager(
-            client=client,
-            journal_path=path,
-            live_trading_enabled=config.live_trading_enabled,
-        )
-        cleanup_ref = await manager.cleanup(
-            journal=journal, execute=True, client_order_id=_client_order_id()
-        )
+            results.append(
+                {"journal": str(path), "state": "cleaned-up", "cleanup_ref": cleanup_ref}
+            )
     return CommandResult(
         "recover",
-        Outcome.SUCCESS,
-        "Tracked position was cleaned up and confirmed closed.",
-        {"cleanup_ref": cleanup_ref},
+        Outcome.BLOCKED if blocked else Outcome.SUCCESS,
+        (
+            "One or more journals require inspection or both execution gates."
+            if blocked
+            else "Tracked positions were reconciled."
+        ),
+        {"journals": results},
     )
