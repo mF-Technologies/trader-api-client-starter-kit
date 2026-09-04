@@ -71,8 +71,11 @@ trader-api-examples algo-runner --config config.local.yaml
 ```
 
 The runner evaluates each completed bar once and writes `runtime/algo-heartbeat.json` for
-external health monitoring. Stale or insufficient historical bars pause only the affected
-instance and block new entries while healthy instances continue. The paused instance retries
+external health monitoring. By default it runs until interrupted; set
+`max_runtime_seconds` to a positive value only when a bounded QA run is required. `bar_count`
+controls the completed-candle history used for indicator warm-up, while `poll_seconds` controls
+how often the runner checks quotes and completed bars. Stale or insufficient historical bars
+pause only the affected instance and block new entries while healthy instances continue. The paused instance retries
 ChartServer every `market_data_retry_seconds` and automatically resumes after valid bars
 return. If it owns a position and data remains unavailable for
 `stale_position_grace_seconds`, the runner closes that position through REST and continues

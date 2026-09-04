@@ -97,7 +97,7 @@ def _event_data(result: AlgoResult) -> list[dict[str, Any]]:
 @dataclass
 class _InstanceRuntime:
     config: AlgoInstanceConfig
-    deadline: float
+    deadline: float | None
     manager: ExecutionManager | None = None
     journal: Journal | None = None
     owned_side: PositionSide | None = None
@@ -281,7 +281,9 @@ def _latest_is_stale(bars: list[Bar], config: AppConfig) -> bool:
 async def live_algo(config: AppConfig, mode: str, execute: bool) -> CommandResult:
     if mode == "live-execute":
         assert_live_execution_enabled(enabled=config.live_trading_enabled, execute=execute)
-    deadline = asyncio.get_running_loop().time() + config.trading.max_runtime_seconds
+    loop = asyncio.get_running_loop()
+    runtime_seconds = config.trading.max_runtime_seconds
+    deadline = None if runtime_seconds is None else loop.time() + runtime_seconds
     fingerprint = account_fingerprint(config.secrets.api_key)
     manager: ExecutionManager | None = None
     journal: Journal | None = None
@@ -307,7 +309,7 @@ async def live_algo(config: AppConfig, mode: str, execute: bool) -> CommandResul
                     file=sys.stderr,
                 )
         try:
-            while asyncio.get_running_loop().time() < deadline:
+            while deadline is None or loop.time() < deadline:
                 bars = await client.get_completed_bars(
                     contract=config.trading.contract,
                     period_type=config.strategy.period_type,
@@ -560,7 +562,11 @@ async def algo_runner(config: AppConfig, mode: str, execute: bool) -> CommandRes
     states = [
         _InstanceRuntime(
             config=instance,
-            deadline=loop.time() + instance.trading.max_runtime_seconds,
+            deadline=(
+                None
+                if instance.trading.max_runtime_seconds is None
+                else loop.time() + instance.trading.max_runtime_seconds
+            ),
             event_log=InstanceEventLog(instance.name),
         )
         for instance in config.algo_instances
@@ -623,7 +629,7 @@ async def algo_runner(config: AppConfig, mode: str, execute: bool) -> CommandRes
                                 continue
                             instance = state.config
                             now = loop.time()
-                            if now >= state.deadline:
+                            if state.deadline is not None and now >= state.deadline:
                                 await _cleanup_runtime_state(state, execute=execute)
                                 if state.market_data_paused_at is None:
                                     state.status = "runtime-limit"

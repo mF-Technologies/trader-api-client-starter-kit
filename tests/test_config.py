@@ -71,6 +71,18 @@ def test_load_config_reads_dotenv_local_next_to_config(
     assert config.live_trading_enabled is True
 
 
+def test_runtime_is_unbounded_when_max_runtime_is_omitted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text("environment: demo\n", encoding="utf-8")
+    monkeypatch.setenv("TRADER_API_KEY", "secret-api-key")  # pragma: allowlist secret
+
+    config = load_config(config_path)
+
+    assert config.trading.max_runtime_seconds is None
+
+
 def test_environment_variables_override_dotenv_local(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -172,6 +184,7 @@ instances:
     "field,value",
     [
         ("contract", "''"),
+        ("max_runtime_seconds", "0"),
         ("poll_seconds", "0"),
         ("market_data_retry_seconds", "0"),
         ("stale_position_grace_seconds", "0"),
