@@ -4,7 +4,11 @@ from typing import Any
 import pytest
 
 from trader_api_examples.config import AppConfig, EndpointsConfig, Secrets, TradingConfig
-from trader_api_examples.price_client import PriceStreamSession
+from trader_api_examples.price_client import (
+    PriceStreamSession,
+    PriceTransportError,
+    QuoteUnavailableError,
+)
 
 
 class FakePrice:
@@ -80,6 +84,18 @@ class BackgroundDisconnectingPriceClient(FakePriceClient):
         asyncio.create_task(fail_send())
 
 
+class ConnectionEvent:
+    type = "ConnectionEvent"
+    fx_server_connected = True
+    price_agent_connected = False
+
+
+class EventDisconnectingPriceClient(ListeningPriceClient):
+    def add_event_listener(self, callback: Any) -> str:
+        callback(ConnectionEvent())
+        return "event-listener-1"
+
+
 def price_config() -> AppConfig:
     return AppConfig(
         environment="demo",
@@ -144,7 +160,7 @@ async def test_price_session_falls_back_to_polling_when_listener_registration_fa
 async def test_price_session_fails_closed_on_transport_error() -> None:
     client = FailingPriceClient()
 
-    with pytest.raises(TimeoutError, match="transport failed"):
+    with pytest.raises(PriceTransportError, match="transport failed"):
         async with PriceStreamSession(price_config(), client_factory=lambda: client) as session:
             await session.get_quote("LLG", timeout_seconds=0.1)
 
@@ -158,5 +174,23 @@ async def test_price_session_converts_unretrieved_disconnect_task_to_transport_f
         await asyncio.sleep(0)
         await asyncio.sleep(0)
 
-        with pytest.raises(TimeoutError, match="background task disconnected"):
+        with pytest.raises(PriceTransportError, match="background task disconnected"):
+            await session.get_quote("LLG", timeout_seconds=0.1)
+
+
+@pytest.mark.asyncio
+async def test_price_session_distinguishes_missing_quote_from_transport_failure() -> None:
+    client = ListeningPriceClient()
+
+    async with PriceStreamSession(price_config(), client_factory=lambda: client) as session:
+        with pytest.raises(QuoteUnavailableError, match="No fresh quote received for GBPUSD"):
+            await session.get_quote("GBPUSD", timeout_seconds=0.01)
+
+
+@pytest.mark.asyncio
+async def test_price_session_treats_connection_event_as_transport_failure() -> None:
+    client = EventDisconnectingPriceClient()
+
+    async with PriceStreamSession(price_config(), client_factory=lambda: client) as session:
+        with pytest.raises(PriceTransportError, match="reported a disconnect"):
             await session.get_quote("LLG", timeout_seconds=0.1)

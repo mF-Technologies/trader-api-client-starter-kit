@@ -25,7 +25,7 @@ from .config import AlgoInstanceConfig, AppConfig
 from .contracts import calculate_amount, find_contract_setting, validate_amount
 from .execution import ExecutionManager, is_retryable_cleanup_error
 from .output import CommandResult
-from .price_client import PriceStreamSession, Quote, read_quote
+from .price_client import PriceStreamSession, Quote, QuoteUnavailableError, read_quote
 from .runtime import HeartbeatWriter, InstanceEventLog, instance_journal_path
 from .safety import (
     Journal,
@@ -107,6 +107,7 @@ class _InstanceRuntime:
     market_data_paused_at: float | None = None
     next_market_data_retry_at: float = 0.0
     next_cleanup_retry_at: float = 0.0
+    next_price_log_at: float = 0.0
     failure_reason: str | None = None
     events: list[SignalEvent] = field(default_factory=list)
     status: str = "starting"
@@ -584,6 +585,22 @@ def _schedule_cleanup_retry(state: _InstanceRuntime, *, error: ApiError, now: fl
     )
 
 
+async def _cleanup_or_schedule_retry(
+    state: _InstanceRuntime,
+    *,
+    execute: bool,
+    now: float,
+) -> bool:
+    try:
+        await _cleanup_runtime_state(state, execute=execute)
+    except ApiError as error:
+        if not is_retryable_cleanup_error(error):
+            raise
+        _schedule_cleanup_retry(state, error=error, now=now)
+        return False
+    return True
+
+
 async def _pause_runtime_state(
     state: _InstanceRuntime,
     *,
@@ -619,7 +636,7 @@ async def _pause_runtime_state(
             f"Strategy:{state.config.name}",
             "Market data grace period expired; cleaning up the owned position.",
         )
-        await _cleanup_runtime_state(state, execute=execute)
+        await _cleanup_or_schedule_retry(state, execute=execute, now=now)
 
 
 def _recover_runtime_state(state: _InstanceRuntime, *, now: float) -> None:
@@ -703,6 +720,7 @@ async def algo_runner(config: AppConfig, mode: str, execute: bool) -> CommandRes
                         ),
                         live_trading_enabled=config.live_trading_enabled,
                         poll_seconds=min(1.0, state.config.trading.poll_seconds),
+                        cleanup_attempts=1,
                     )
                     try:
                         await _restore_runtime_state(
@@ -730,17 +748,21 @@ async def algo_runner(config: AppConfig, mode: str, execute: bool) -> CommandRes
                             if state.status == "cleanup-pending":
                                 if now < state.next_cleanup_retry_at:
                                     continue
-                                try:
-                                    await _cleanup_runtime_state(state, execute=execute)
-                                except ApiError as error:
-                                    if not is_retryable_cleanup_error(error):
-                                        raise
-                                    _schedule_cleanup_retry(state, error=error, now=loop.time())
+                                if not await _cleanup_or_schedule_retry(
+                                    state,
+                                    execute=execute,
+                                    now=loop.time(),
+                                ):
                                     continue
                                 state.next_cleanup_retry_at = 0.0
                                 state.status = "cleanup-reconciled"
                             if state.deadline is not None and now >= state.deadline:
-                                await _cleanup_runtime_state(state, execute=execute)
+                                if not await _cleanup_or_schedule_retry(
+                                    state,
+                                    execute=execute,
+                                    now=loop.time(),
+                                ):
+                                    continue
                                 if state.market_data_paused_at is None:
                                     state.status = "runtime-limit"
                                 state.completed = True
@@ -759,21 +781,42 @@ async def algo_runner(config: AppConfig, mode: str, execute: bool) -> CommandRes
                                         "Market data grace period expired; cleaning up the "
                                         "owned position.",
                                     )
-                                    await _cleanup_runtime_state(state, execute=execute)
+                                    if not await _cleanup_or_schedule_retry(
+                                        state,
+                                        execute=execute,
+                                        now=loop.time(),
+                                    ):
+                                        continue
                                 continue
 
-                            state.last_quote = await price_session.get_quote(
-                                instance.trading.contract,
-                                timeout_seconds=max(
-                                    1.0, min(10.0, instance.trading.poll_seconds * 2)
-                                ),
-                            )
-                            _write_console_status(
-                                f"Price:{instance.name}",
-                                f"{instance.trading.contract} bid={state.last_quote.bid} "
-                                f"ask={state.last_quote.ask} "
-                                f"tag={'yes' if state.last_quote.tag else 'no'}",
-                            )
+                            try:
+                                state.last_quote = await price_session.get_quote(
+                                    instance.trading.contract,
+                                    timeout_seconds=max(
+                                        1.0, min(10.0, instance.trading.poll_seconds * 2)
+                                    ),
+                                )
+                            except QuoteUnavailableError as error:
+                                await _pause_runtime_state(
+                                    state,
+                                    status="stale-quote",
+                                    message=str(error),
+                                    execute=execute,
+                                    now=loop.time(),
+                                )
+                                continue
+                            quote_received_at = loop.time()
+                            if quote_received_at >= state.next_price_log_at:
+                                _write_console_status(
+                                    f"Price:{instance.name}",
+                                    f"{instance.trading.contract} bid={state.last_quote.bid} "
+                                    f"ask={state.last_quote.ask} "
+                                    f"tag={'yes' if state.last_quote.tag else 'no'}",
+                                )
+                                state.next_price_log_at = (
+                                    quote_received_at
+                                    + instance.trading.price_log_interval_seconds
+                                )
                             state.status = "streaming"
                             bars = await client.get_completed_bars(
                                 contract=instance.trading.contract,
@@ -858,7 +901,8 @@ async def algo_runner(config: AppConfig, mode: str, execute: bool) -> CommandRes
                             state.events.append(event)
                             _write_console_status(
                                 f"Strategy:{instance.name}",
-                                f"Signal confirmed: {event.signal.value}",
+                                f"Signal confirmed: {event.signal.value} "
+                                f"bid={state.last_quote.bid} ask={state.last_quote.ask}",
                             )
                             state.event_log.write(
                                 "SIGNAL",
@@ -938,7 +982,12 @@ async def algo_runner(config: AppConfig, mode: str, execute: bool) -> CommandRes
                                 )
                                 state.status = "position-open"
                             elif state.journal is not None:
-                                await _cleanup_runtime_state(state, execute=execute)
+                                if not await _cleanup_or_schedule_retry(
+                                    state,
+                                    execute=execute,
+                                    now=loop.time(),
+                                ):
+                                    continue
                                 state.status = "round-trip-complete"
                                 state.completed = True
 
@@ -951,10 +1000,28 @@ async def algo_runner(config: AppConfig, mode: str, execute: bool) -> CommandRes
                         if active_polls:
                             await asyncio.sleep(min(active_polls))
                 finally:
+                    primary_error = sys.exception()
                     for state in states:
                         if state.journal is not None:
-                            await _cleanup_runtime_state(state, execute=execute)
-                            state.status = "cleaned-up"
+                            try:
+                                await _cleanup_runtime_state(state, execute=execute)
+                                state.status = "cleaned-up"
+                            except Exception as cleanup_error:
+                                if primary_error is None:
+                                    raise
+                                state.status = "cleanup-deferred"
+                                if state.event_log is not None:
+                                    state.event_log.write(
+                                        "CLEANUP_DEFERRED",
+                                        deal_ref=state.journal.order_ref,
+                                        error_type=type(cleanup_error).__name__,
+                                        message=str(cleanup_error),
+                                    )
+                                _write_console_status(
+                                    f"REST:{state.config.name}",
+                                    f"Shutdown cleanup deferred: {cleanup_error} "
+                                    "The ownership journal was retained.",
+                                )
                     heartbeat.write({state.config.name: state.status for state in states})
     except Exception as error:
         _write_console_status("Runner", f"Stopped by {type(error).__name__}: {error}")

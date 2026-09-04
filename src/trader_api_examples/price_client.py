@@ -9,6 +9,14 @@ from typing import Any, Protocol
 from .config import AppConfig, ConfigError
 
 
+class PriceTransportError(TimeoutError):
+    """Raised when the shared FxServer/Price Agent transport is unhealthy."""
+
+
+class QuoteUnavailableError(TimeoutError):
+    """Raised when one contract has no fresh quote on a healthy transport."""
+
+
 @dataclass(frozen=True)
 class Quote:
     contract: str
@@ -34,6 +42,7 @@ class PriceStreamSession:
         self._client_factory = client_factory
         self._client: PriceClient | None = None
         self._price_listener_id: str | None = None
+        self._event_listener_id: str | None = None
         self._last_updates: dict[str, float] = {}
         self._loop: asyncio.AbstractEventLoop | None = None
         self._previous_exception_handler: (
@@ -104,6 +113,12 @@ class PriceStreamSession:
                 self._price_listener_id = str(add_listener(self._record_price_update))
         except Exception:
             self._price_listener_id = None
+        add_event_listener = getattr(client, "add_event_listener", None)
+        try:
+            if add_event_listener is not None:
+                self._event_listener_id = str(add_event_listener(self._record_server_event))
+        except Exception:
+            self._event_listener_id = None
 
     async def close(self) -> None:
         client, self._client = self._client, None
@@ -113,6 +128,7 @@ class PriceStreamSession:
         # fxserverclientpython 0.1.10 can crash its native job runner during logout.
         # Event-loop shutdown closes this process-scoped transport instead.
         self._price_listener_id = None
+        self._event_listener_id = None
         self._last_updates.clear()
         await asyncio.sleep(0)
         self._restore_loop_exception_handler()
@@ -121,6 +137,16 @@ class PriceStreamSession:
         received_at = time.monotonic()
         for contract in getattr(event, "contract_codes", ()):
             self._last_updates[str(contract).strip().upper()] = received_at
+
+    def _record_server_event(self, event: Any) -> None:
+        if getattr(event, "type", "") != "ConnectionEvent":
+            return
+        fx_connected = bool(getattr(event, "fx_server_connected", True))
+        price_connected = bool(getattr(event, "price_agent_connected", True))
+        if not fx_connected or not price_connected:
+            self._background_error = RuntimeError(
+                "FxServer or Price Agent reported a disconnect."
+            )
 
     def _handle_loop_exception(
         self, loop: asyncio.AbstractEventLoop, context: dict[str, Any]
@@ -145,9 +171,11 @@ class PriceStreamSession:
 
     def _raise_background_error(self) -> None:
         if self._background_error is not None:
-            raise TimeoutError(
-                "Price transport background task disconnected; restart the process."
-            ) from self._background_error
+            if str(self._background_error) == "Client is not connected":
+                message = "Price transport background task disconnected; restart the process."
+            else:
+                message = "Price transport reported a disconnect; restart the process."
+            raise PriceTransportError(message) from self._background_error
 
     async def get_quote(self, contract: str, *, timeout_seconds: float = 10) -> Quote:
         if timeout_seconds <= 0:
@@ -163,7 +191,7 @@ class PriceStreamSession:
             try:
                 price = self._client.get_price_info(contract)
             except Exception as error:
-                raise TimeoutError(f"Price transport failed for {contract}.") from error
+                raise PriceTransportError(f"Price transport failed for {contract}.") from error
             last_update = self._last_updates.get(contract.strip().upper())
             listener_is_fresh = (
                 self._price_listener_id is None
@@ -178,7 +206,7 @@ class PriceStreamSession:
                     tag=str(price.tag),
                 )
             await asyncio.sleep(min(0.1, timeout_seconds))
-        raise TimeoutError(f"No fresh quote received for {contract}; restart the process.")
+        raise QuoteUnavailableError(f"No fresh quote received for {contract}.")
 
 
 async def read_quote(config: AppConfig, timeout_seconds: float = 10) -> Quote:
