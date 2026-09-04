@@ -16,7 +16,7 @@ from trader_api_examples.config import (
     StrategyConfig,
     TradingConfig,
 )
-from trader_api_examples.price_client import Quote
+from trader_api_examples.price_client import Quote, QuoteUnavailableError
 from trader_api_examples.runtime import instance_journal_path
 from trader_api_examples.safety import Journal, JournalState
 from trader_api_examples.strategy import Signal
@@ -141,6 +141,13 @@ class TemporarilyIlliquidCleanupClient(ExecutingTraderClient):
         return "liquidate-1"
 
 
+class AlwaysIlliquidCleanupClient(TemporarilyIlliquidCleanupClient):
+    async def liquidate_market_deal(self, **kwargs: Any) -> str:
+        self.liquidate_count += 1
+        self.liquidate_ids.append(int(kwargs["client_order_id"]))
+        raise ApiError("liquidate returned HTTP 400 (934).", 400, "934")
+
+
 class FakePriceSession:
     enter_count = 0
     contracts: list[str] = []
@@ -158,6 +165,33 @@ class FakePriceSession:
     async def get_quote(self, contract: str, **_: Any) -> Quote:
         type(self).contracts.append(contract)
         return Quote(contract, 1.0, 1.1, f"{contract}-tag")
+
+
+class FailingPriceSession(FakePriceSession):
+    async def get_quote(self, contract: str, **_: Any) -> Quote:
+        raise TimeoutError(f"Shared price stream failed for {contract}.")
+
+
+class PartiallyUnavailablePriceSession(FakePriceSession):
+    async def get_quote(self, contract: str, **_: Any) -> Quote:
+        if contract == "GBPUSD":
+            raise QuoteUnavailableError(f"No fresh quote received for {contract}.")
+        return await super().get_quote(contract)
+
+
+class RecoveringQuotePriceSession(FakePriceSession):
+    attempts: dict[str, int] = {}
+
+    def __init__(self, config: AppConfig) -> None:
+        super().__init__(config)
+        type(self).attempts = {}
+
+    async def get_quote(self, contract: str, **_: Any) -> Quote:
+        attempts = self.attempts.get(contract, 0) + 1
+        self.attempts[contract] = attempts
+        if contract == "GBPUSD" and attempts <= 2:
+            raise QuoteUnavailableError(f"No fresh quote received for {contract}.")
+        return await super().get_quote(contract)
 
 
 class FakeHeartbeat:
@@ -462,6 +496,7 @@ async def test_algo_runner_executes_rest_round_trip_and_clears_journal(
     assert "[REST:default] Contract settings validated" in stderr
     assert "[Price] Shared price session connected" in stderr
     assert "[Price:default] EURUSD bid=1.0 ask=1.1 tag=yes" in stderr
+    assert stderr.count("[Price:default]") == 1
     assert "[Chart:default] Historical candles loaded count=40 period_type=1" in stderr
     assert "[Strategy:default] Indicators calculated" in stderr
     assert "indicators=rsi=50" in stderr
@@ -574,7 +609,7 @@ async def test_algo_runner_retries_pending_cleanup_before_resuming_after_restart
 
 
 @pytest.mark.asyncio
-async def test_temporary_cleanup_rejection_does_not_stop_other_instances(
+async def test_close_signal_cleanup_rejection_does_not_stop_other_instances(
     tmp_path: Any,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -622,6 +657,78 @@ async def test_temporary_cleanup_rejection_does_not_stop_other_instances(
         side="BUY",
         amount=1000,
         client_order_id=123,
+    ).with_state(JournalState.OPEN, order_ref="deal-1")
+
+    def close_signal(*_args: Any, **kwargs: Any) -> StrategyEvaluation:
+        if kwargs["position_side"] is None:
+            return StrategyEvaluation(None, {"rsi": 50})
+        return StrategyEvaluation(SignalEvent(1, Signal.CLOSE_BUY, 50, 1, "rsi"), {"rsi": 50})
+
+    monkeypatch.setattr(
+        "trader_api_examples.commands.make_client", lambda *_args, **_kwargs: client
+    )
+    monkeypatch.setattr("trader_api_examples.commands.PriceStreamSession", FakePriceSession)
+    monkeypatch.setattr("trader_api_examples.commands.HeartbeatWriter", lambda: FakeHeartbeat())
+    monkeypatch.setattr("trader_api_examples.commands.evaluate_latest_strategy", close_signal)
+
+    result = await algo_runner(config, "live-execute", execute=True)
+
+    assert result.outcome.value == "SUCCESS"
+    assert client.liquidate_count == 6
+    assert client.contract_calls["EURUSD"] >= 1
+    assert result.data["instances"]["healthy"]["status"] == "runtime-limit"
+    assert not path.exists()
+
+
+@pytest.mark.asyncio
+async def test_shutdown_cleanup_does_not_mask_shared_transport_failure(
+    tmp_path: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    trading = TradingConfig(
+        contract="EURUSD",
+        amount=1000,
+        max_runtime_seconds=None,
+        poll_seconds=0.001,
+        market_data_retry_seconds=30,
+    )
+    config = AppConfig(
+        environment="demo",
+        endpoints=EndpointsConfig(
+            web_proxy_url="https://webproxy.example",
+            fxserver_rest_url="https://fxserver.example",
+            chart_server_url="https://chart.example",
+        ),
+        trading=trading,
+        strategy=StrategyConfig(),
+        instances=(
+            AlgoInstanceConfig(
+                "cleanup",
+                TradingConfig(
+                    contract="GBPUSD",
+                    amount=1000,
+                    max_runtime_seconds=None,
+                    poll_seconds=0.001,
+                    market_data_retry_seconds=30,
+                ),
+                StrategyConfig(),
+            ),
+            AlgoInstanceConfig("healthy", trading, StrategyConfig()),
+        ),
+        secrets=Secrets(api_key="api-key", username="user", trade_key="trade-key"),
+        live_trading_enabled=True,
+    )
+    client = AlwaysIlliquidCleanupClient()
+    monkeypatch.chdir(tmp_path)
+    path = instance_journal_path("cleanup", "GBPUSD")
+    Journal.begin_submission(
+        path=path,
+        run_id="previous-run",
+        account_fingerprint="key-8c284055dbb5",
+        contract="GBPUSD",
+        side="BUY",
+        amount=1000,
+        client_order_id=123,
     ).with_state(
         JournalState.CLEANUP_PENDING,
         order_ref="deal-1",
@@ -631,16 +738,108 @@ async def test_temporary_cleanup_rejection_does_not_stop_other_instances(
     monkeypatch.setattr(
         "trader_api_examples.commands.make_client", lambda *_args, **_kwargs: client
     )
-    monkeypatch.setattr("trader_api_examples.commands.PriceStreamSession", FakePriceSession)
+    monkeypatch.setattr("trader_api_examples.commands.PriceStreamSession", FailingPriceSession)
     monkeypatch.setattr("trader_api_examples.commands.HeartbeatWriter", lambda: FakeHeartbeat())
 
-    result = await algo_runner(config, "live-execute", execute=True)
+    with pytest.raises(TimeoutError, match="Shared price stream failed"):
+        await algo_runner(config, "live-execute", execute=True)
+
+    assert path.exists()
+
+
+@pytest.mark.asyncio
+async def test_missing_quote_pauses_only_the_affected_instance(
+    tmp_path: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    trading = TradingConfig(
+        contract="EURUSD",
+        amount=1000,
+        max_runtime_seconds=0.03,
+        poll_seconds=0.001,
+        market_data_retry_seconds=0.001,
+    )
+    config = AppConfig(
+        environment="demo",
+        endpoints=EndpointsConfig(
+            web_proxy_url="https://webproxy.example",
+            fxserver_rest_url="https://fxserver.example",
+            chart_server_url="https://chart.example",
+        ),
+        trading=trading,
+        strategy=StrategyConfig(),
+        instances=(
+            AlgoInstanceConfig(
+                "missing",
+                TradingConfig(
+                    contract="GBPUSD",
+                    amount=1000,
+                    max_runtime_seconds=0.03,
+                    poll_seconds=0.001,
+                    market_data_retry_seconds=0.001,
+                ),
+                StrategyConfig(),
+            ),
+            AlgoInstanceConfig("healthy", trading, StrategyConfig()),
+        ),
+        secrets=Secrets(api_key="api-key", username="user", trade_key="trade-key"),
+    )
+    client = TemporarilyIlliquidCleanupClient()
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(
+        "trader_api_examples.commands.make_client", lambda *_args, **_kwargs: client
+    )
+    monkeypatch.setattr(
+        "trader_api_examples.commands.PriceStreamSession", PartiallyUnavailablePriceSession
+    )
+    monkeypatch.setattr("trader_api_examples.commands.HeartbeatWriter", lambda: FakeHeartbeat())
+
+    result = await algo_runner(config, "live-observe", execute=False)
+
+    assert result.outcome.value == "INCONCLUSIVE"
+    assert client.contract_calls["EURUSD"] >= 1
+    assert result.data["instances"]["missing"]["failure_reason"] == "stale-quote"
+    assert result.data["instances"]["healthy"]["status"] == "runtime-limit"
+
+
+@pytest.mark.asyncio
+async def test_instance_resumes_after_quote_stream_recovers(
+    tmp_path: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    trading = TradingConfig(
+        contract="GBPUSD",
+        amount=1000,
+        max_runtime_seconds=0.05,
+        poll_seconds=0.001,
+        market_data_retry_seconds=0.001,
+    )
+    config = AppConfig(
+        environment="demo",
+        endpoints=EndpointsConfig(
+            web_proxy_url="https://webproxy.example",
+            fxserver_rest_url="https://fxserver.example",
+            chart_server_url="https://chart.example",
+        ),
+        trading=trading,
+        strategy=StrategyConfig(),
+        secrets=Secrets(api_key="api-key", username="user", trade_key="trade-key"),
+    )
+    client = TemporarilyIlliquidCleanupClient()
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(
+        "trader_api_examples.commands.make_client", lambda *_args, **_kwargs: client
+    )
+    monkeypatch.setattr(
+        "trader_api_examples.commands.PriceStreamSession", RecoveringQuotePriceSession
+    )
+    monkeypatch.setattr("trader_api_examples.commands.HeartbeatWriter", lambda: FakeHeartbeat())
+
+    result = await algo_runner(config, "live-observe", execute=False)
 
     assert result.outcome.value == "NO_SIGNAL"
-    assert client.liquidate_count == 6
-    assert client.contract_calls["EURUSD"] >= 1
-    assert result.data["instances"]["healthy"]["status"] == "runtime-limit"
-    assert not path.exists()
+    assert RecoveringQuotePriceSession.attempts["GBPUSD"] >= 3
+    assert result.data["instances"]["default"]["failure_reason"] is None
 
 
 @pytest.mark.asyncio

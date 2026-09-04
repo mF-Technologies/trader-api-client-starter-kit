@@ -22,6 +22,7 @@ from .config import ConfigError, load_config
 from .contracts import ContractError
 from .output import CommandResult, write_result
 from .safety import LiveExecutionBlocked
+from .supervisor import run_supervisor
 
 COMMANDS = (
     "account-inspector",
@@ -58,6 +59,7 @@ def build_parser() -> argparse.ArgumentParser:
                 "--mode", choices=("live-observe", "live-execute"), default="live-observe"
             )
             child.add_argument("--execute", action="store_true")
+            child.add_argument("--worker", action="store_true", help=argparse.SUPPRESS)
         if command == "market-data-monitor":
             child.add_argument("--bars-only", action="store_true")
     return parser
@@ -69,6 +71,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     replay = args.command == "rsi-algo-demo" and args.mode == "replay"
     try:
         config = load_config(args.config, require_api_key=not replay)
+        if args.command == "algo-runner" and not args.worker:
+            return run_supervisor(
+                _algo_worker_command(args, output),
+                restart_delay_seconds=config.trading.market_data_retry_seconds,
+            )
         result = _run_command(args, config)
     except (ApiError, ConfigError, ContractError, LiveExecutionBlocked, ValueError) as error:
         result = CommandResult(args.command, Outcome.BLOCKED, str(error), {})
@@ -79,6 +86,25 @@ def main(argv: Sequence[str] | None = None) -> int:
         result = CommandResult(args.command, Outcome.ERROR, "Unexpected command failure.", {})
     write_result(result, output=output, stream=sys.stdout)
     return _exit_code(result.outcome)
+
+
+def _algo_worker_command(args: argparse.Namespace, output: str) -> list[str]:
+    command = [
+        sys.executable,
+        "-m",
+        "trader_api_examples.cli",
+        "algo-runner",
+        "--config",
+        str(args.config),
+        "--mode",
+        str(args.mode),
+        "--output",
+        output,
+        "--worker",
+    ]
+    if args.execute:
+        command.append("--execute")
+    return command
 
 
 def _run_command(args: argparse.Namespace, config: object) -> CommandResult:

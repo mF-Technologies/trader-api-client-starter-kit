@@ -15,6 +15,9 @@ trading:
   poll_seconds: 5
   # Completed candles fetched for indicator warm-up and calculation.
   bar_count: 200
+  # Print a price heartbeat per symbol without logging every poll or tick.
+  price_log_interval_seconds: 30
+  # Retry paused symbols and restart a failed WebSocket worker after this delay.
   market_data_retry_seconds: 30
   stale_position_grace_seconds: 120
 

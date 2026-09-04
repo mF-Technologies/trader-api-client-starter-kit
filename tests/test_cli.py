@@ -32,6 +32,26 @@ def test_algo_runner_defaults_to_observe_mode() -> None:
     assert args.execute is False
 
 
+def test_algo_runner_uses_process_supervisor_by_default(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = tmp_path / "config.yaml"
+    config.write_text("environment: demo\n", encoding="utf-8")
+    monkeypatch.setenv("TRADER_API_KEY", "api-key")
+    commands: list[list[str]] = []
+
+    monkeypatch.setattr(
+        "trader_api_examples.cli.run_supervisor",
+        lambda command, **_kwargs: commands.append(list(command)) or 17,
+    )
+
+    exit_code = main(["algo-runner", "--config", str(config)])
+
+    assert exit_code == 17
+    assert commands[0][-1] == "--worker"
+
+
 def test_replay_runs_without_api_key_and_writes_json(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:

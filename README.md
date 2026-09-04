@@ -74,13 +74,14 @@ The runner evaluates each completed bar once and writes `runtime/algo-heartbeat.
 external health monitoring. By default it runs until interrupted; set
 `max_runtime_seconds` to a positive value only when a bounded QA run is required. `bar_count`
 controls the completed-candle history used for indicator warm-up, while `poll_seconds` controls
-how often the runner checks quotes and completed bars. Stale or insufficient historical bars
-pause only the affected instance and block new entries while healthy instances continue. The paused instance retries
-ChartServer every `market_data_retry_seconds` and automatically resumes after valid bars
-return. If it owns a position and data remains unavailable for
+how often the runner checks quotes and completed bars. Stale quotes, stale bars, or insufficient
+historical bars pause only the affected instance and block new entries while healthy instances
+continue. The paused instance retries market data every `market_data_retry_seconds` and
+automatically resumes after valid data returns. If it owns a position and data remains unavailable for
 `stale_position_grace_seconds`, the runner closes that position through REST and continues
-retrying market data. Shared transport failures, invalid contract amounts, cleanup failures,
-and unresolved ownership journals stop the runner.
+retrying market data. Temporary `934` liquidation failures retain the ownership journal and
+retry only the affected instance. Invalid contract amounts and unresolved ownership journals
+stop the worker without automatic restart.
 
 Each instance also writes a structured event stream to `runtime/logs/<instance>.jsonl`.
 It records bar evaluations and indicator values, signals, order and liquidation attempts,
@@ -89,10 +90,12 @@ files rotate at 10 MB with five backups. Credentials, tokens, and full price tag
 included. These diagnostic logs are separate from the temporary ownership journals used
 for recovery.
 
-With `fxserverclientpython` 0.1.10, the WebSocket client is process-scoped. The runner
-fails closed when the price transport becomes unhealthy; an external supervisor may then
-restart the process. It does not call the package's unstable logout path or reconnect in
-the same process.
+With `fxserverclientpython` 0.1.10, the WebSocket client is process-scoped. The default
+`algo-runner` command therefore supervises a child worker. When the shared FxServer or Price
+Agent transport becomes unhealthy, the worker exits, retains any unresolved ownership
+journals, and is restarted after `market_data_retry_seconds`. The new worker creates a fresh
+WebSocket session and reconciles each journal before strategy evaluation resumes. It does not
+call the package's unstable logout path or reconnect inside the failed process.
 
 ## RSI Replay Demo
 
