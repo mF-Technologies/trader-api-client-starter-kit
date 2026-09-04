@@ -10,9 +10,15 @@ import httpx
 class ApiError(RuntimeError):
     """Raised for a safe-to-display Trader API failure."""
 
-    def __init__(self, message: str, status_code: int | None = None) -> None:
+    def __init__(
+        self,
+        message: str,
+        status_code: int | None = None,
+        error_code: str | None = None,
+    ) -> None:
         super().__init__(message)
         self.status_code = status_code
+        self.error_code = error_code
 
     @property
     def is_definitive_rejection(self) -> bool:
@@ -268,6 +274,7 @@ class TraderApiClient:
             raise ApiError(
                 f"{context} returned HTTP {response.status_code}{suffix}.",
                 response.status_code,
+                message or None,
             )
 
     @staticmethod

@@ -132,6 +132,12 @@ Before submitting, the tool displays a redacted account fingerprint, environment
 contract, side, and amount. It persists a minimal ignored recovery journal before sending
 `addDeal`. The tool only closes positions whose ownership it can establish. Unrelated
 positions produce a warning; unresolved or ambiguous ownership blocks new submissions.
+On restart, `algo-runner` restores a confirmed open position from its per-instance journal.
+If shutdown was interrupted during cleanup, it retries that cleanup with the persisted
+intent before resuming the strategy. Temporary `710` or `934` cleanup rejections keep only
+that instance in `cleanup-pending`; the position remains tracked and cleanup is retried while
+other instances continue. It never adopts an account position without a matching ownership
+journal.
 
 The current API prevents duplicate requests with `clientOrderId`, but the current query
 contracts do not expose a reliable `clientOrderId` correlation. When a submission outcome

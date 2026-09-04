@@ -17,6 +17,8 @@ from trader_api_examples.config import (
     TradingConfig,
 )
 from trader_api_examples.price_client import Quote
+from trader_api_examples.runtime import instance_journal_path
+from trader_api_examples.safety import Journal, JournalState
 from trader_api_examples.strategy import Signal
 
 
@@ -56,6 +58,7 @@ class ExecutingTraderClient(FakeTraderClient):
         self.add_count = 0
         self.liquidate_count = 0
         self.position_open = False
+        self.liquidate_ids: list[int] = []
 
     async def add_market_deal(self, **_: Any) -> str:
         self.add_count += 1
@@ -65,8 +68,9 @@ class ExecutingTraderClient(FakeTraderClient):
     async def get_position_detail(self, order_ref: str) -> dict[str, str] | None:
         return {"dealRef": order_ref} if self.position_open else None
 
-    async def liquidate_market_deal(self, **_: Any) -> str:
+    async def liquidate_market_deal(self, **kwargs: Any) -> str:
         self.liquidate_count += 1
+        self.liquidate_ids.append(int(kwargs["client_order_id"]))
         self.position_open = False
         return "liquidate-1"
 
@@ -114,6 +118,27 @@ class PartiallyRejectedTraderClient(FakeTraderClient):
 
     async def add_market_deal(self, **_: Any) -> str:
         raise ApiError("addDeal returned HTTP 400 (Not Available to trade this contract).", 400)
+
+
+class TemporarilyIlliquidCleanupClient(ExecutingTraderClient):
+    def __init__(self) -> None:
+        super().__init__()
+        self.position_open = True
+        self.contract_calls: dict[str, int] = {}
+
+    async def get_completed_bars(self, **kwargs: Any) -> list[Bar]:
+        contract = str(kwargs["contract"])
+        self.contract_calls[contract] = self.contract_calls.get(contract, 0) + 1
+        time_ms = int(datetime.now(UTC).timestamp() * 1000) - 60_000
+        return [Bar(time_ms=time_ms, open=1, high=1, low=1, close=1)] * 40
+
+    async def liquidate_market_deal(self, **kwargs: Any) -> str:
+        self.liquidate_count += 1
+        self.liquidate_ids.append(int(kwargs["client_order_id"]))
+        if self.liquidate_count <= 5:
+            raise ApiError("liquidate returned HTTP 400 (934).", 400, "934")
+        self.position_open = False
+        return "liquidate-1"
 
 
 class FakePriceSession:
@@ -442,6 +467,180 @@ async def test_algo_runner_executes_rest_round_trip_and_clears_journal(
     assert "indicators=rsi=50" in stderr
     assert "[REST:default] Position confirmed deal_ref=deal-1" in stderr
     assert "[REST:default] Position closed cleanup_ref=liquidate-1" in stderr
+
+
+@pytest.mark.asyncio
+async def test_algo_runner_restores_open_position_from_journal_after_restart(
+    tmp_path: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    trading = TradingConfig(
+        contract="EURUSD", amount=1000, max_runtime_seconds=0.1, poll_seconds=0.001
+    )
+    config = AppConfig(
+        environment="demo",
+        endpoints=EndpointsConfig(
+            web_proxy_url="https://webproxy.example",
+            fxserver_rest_url="https://fxserver.example",
+            chart_server_url="https://chart.example",
+        ),
+        trading=trading,
+        strategy=StrategyConfig(),
+        secrets=Secrets(api_key="api-key", username="user", trade_key="trade-key"),
+        live_trading_enabled=True,
+    )
+    client = ExecutingTraderClient()
+    client.position_open = True
+    monkeypatch.chdir(tmp_path)
+    path = instance_journal_path("default", "EURUSD")
+    Journal.begin_submission(
+        path=path,
+        run_id="previous-run",
+        account_fingerprint="key-8c284055dbb5",
+        contract="EURUSD",
+        side="BUY",
+        amount=1000,
+        client_order_id=123,
+    ).with_state(JournalState.OPEN, order_ref="deal-1")
+
+    def close_signal(*_args: Any, **_kwargs: Any) -> StrategyEvaluation:
+        return StrategyEvaluation(SignalEvent(1, Signal.CLOSE_BUY, 50, 1, "rsi"), {"rsi": 50})
+
+    monkeypatch.setattr(
+        "trader_api_examples.commands.make_client", lambda *_args, **_kwargs: client
+    )
+    monkeypatch.setattr("trader_api_examples.commands.PriceStreamSession", FakePriceSession)
+    monkeypatch.setattr("trader_api_examples.commands.HeartbeatWriter", lambda: FakeHeartbeat())
+    monkeypatch.setattr("trader_api_examples.commands.evaluate_latest_strategy", close_signal)
+
+    result = await algo_runner(config, "live-execute", execute=True)
+
+    assert result.outcome.value == "SUCCESS"
+    assert client.add_count == 0
+    assert client.liquidate_count == 1
+    assert not path.exists()
+
+
+@pytest.mark.asyncio
+async def test_algo_runner_retries_pending_cleanup_before_resuming_after_restart(
+    tmp_path: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    trading = TradingConfig(
+        contract="EURUSD", amount=1000, max_runtime_seconds=0.03, poll_seconds=0.001
+    )
+    config = AppConfig(
+        environment="demo",
+        endpoints=EndpointsConfig(
+            web_proxy_url="https://webproxy.example",
+            fxserver_rest_url="https://fxserver.example",
+            chart_server_url="https://chart.example",
+        ),
+        trading=trading,
+        strategy=StrategyConfig(),
+        secrets=Secrets(api_key="api-key", username="user", trade_key="trade-key"),
+        live_trading_enabled=True,
+    )
+    client = ExecutingTraderClient()
+    client.position_open = True
+    monkeypatch.chdir(tmp_path)
+    path = instance_journal_path("default", "EURUSD")
+    Journal.begin_submission(
+        path=path,
+        run_id="previous-run",
+        account_fingerprint="key-8c284055dbb5",
+        contract="EURUSD",
+        side="BUY",
+        amount=1000,
+        client_order_id=123,
+    ).with_state(
+        JournalState.CLEANUP_PENDING,
+        order_ref="deal-1",
+        cleanup_client_order_id=456,
+    )
+
+    monkeypatch.setattr(
+        "trader_api_examples.commands.make_client", lambda *_args, **_kwargs: client
+    )
+    monkeypatch.setattr("trader_api_examples.commands.PriceStreamSession", FakePriceSession)
+    monkeypatch.setattr("trader_api_examples.commands.HeartbeatWriter", lambda: FakeHeartbeat())
+
+    result = await algo_runner(config, "live-execute", execute=True)
+
+    assert result.outcome.value == "NO_SIGNAL"
+    assert client.add_count == 0
+    assert client.liquidate_ids == [456]
+    assert not path.exists()
+
+
+@pytest.mark.asyncio
+async def test_temporary_cleanup_rejection_does_not_stop_other_instances(
+    tmp_path: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    trading = TradingConfig(
+        contract="EURUSD",
+        amount=1000,
+        max_runtime_seconds=0.5,
+        poll_seconds=0.001,
+        market_data_retry_seconds=0.001,
+    )
+    config = AppConfig(
+        environment="demo",
+        endpoints=EndpointsConfig(
+            web_proxy_url="https://webproxy.example",
+            fxserver_rest_url="https://fxserver.example",
+            chart_server_url="https://chart.example",
+        ),
+        trading=trading,
+        strategy=StrategyConfig(),
+        instances=(
+            AlgoInstanceConfig(
+                "cleanup",
+                TradingConfig(
+                    contract="GBPUSD",
+                    amount=1000,
+                    max_runtime_seconds=0.05,
+                    poll_seconds=0.001,
+                    market_data_retry_seconds=0.001,
+                ),
+                StrategyConfig(),
+            ),
+            AlgoInstanceConfig("healthy", trading, StrategyConfig()),
+        ),
+        secrets=Secrets(api_key="api-key", username="user", trade_key="trade-key"),
+        live_trading_enabled=True,
+    )
+    client = TemporarilyIlliquidCleanupClient()
+    monkeypatch.chdir(tmp_path)
+    path = instance_journal_path("cleanup", "GBPUSD")
+    Journal.begin_submission(
+        path=path,
+        run_id="previous-run",
+        account_fingerprint="key-8c284055dbb5",
+        contract="GBPUSD",
+        side="BUY",
+        amount=1000,
+        client_order_id=123,
+    ).with_state(
+        JournalState.CLEANUP_PENDING,
+        order_ref="deal-1",
+        cleanup_client_order_id=456,
+    )
+
+    monkeypatch.setattr(
+        "trader_api_examples.commands.make_client", lambda *_args, **_kwargs: client
+    )
+    monkeypatch.setattr("trader_api_examples.commands.PriceStreamSession", FakePriceSession)
+    monkeypatch.setattr("trader_api_examples.commands.HeartbeatWriter", lambda: FakeHeartbeat())
+
+    result = await algo_runner(config, "live-execute", execute=True)
+
+    assert result.outcome.value == "NO_SIGNAL"
+    assert client.liquidate_count == 6
+    assert client.contract_calls["EURUSD"] >= 1
+    assert result.data["instances"]["healthy"]["status"] == "runtime-limit"
+    assert not path.exists()
 
 
 @pytest.mark.asyncio
