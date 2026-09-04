@@ -29,13 +29,9 @@ class PriceStreamSession:
         config: AppConfig,
         *,
         client_factory: Callable[[], PriceClient] | None = None,
-        max_reconnects: int = 1,
     ) -> None:
-        if max_reconnects < 0:
-            raise ValueError("max_reconnects must not be negative.")
         self.config = config
         self._client_factory = client_factory
-        self.max_reconnects = max_reconnects
         self._client: PriceClient | None = None
         self._price_listener_id: str | None = None
         self._last_updates: dict[str, float] = {}
@@ -72,7 +68,8 @@ class PriceStreamSession:
 
     async def connect(self) -> None:
         self._validate()
-        await self.close()
+        if self._client is not None:
+            return
         client = self._make_client()
         client.init(
             {
@@ -84,11 +81,7 @@ class PriceStreamSession:
                 "valid_generated_token": self.config.secrets.api_key,
             }
         )
-        try:
-            await client.login()
-        except Exception:
-            await self._close_client(client)
-            raise
+        await client.login()
         self._client = client
         self._last_updates.clear()
         add_listener = getattr(client, "add_price_listener", None)
@@ -96,70 +89,50 @@ class PriceStreamSession:
             if add_listener is not None:
                 self._price_listener_id = str(add_listener(self._record_price_update))
         except Exception:
-            await self.close()
-            raise
+            self._price_listener_id = None
 
     async def close(self) -> None:
         client, self._client = self._client, None
         if client is None:
             return
-        if self._price_listener_id is not None:
-            remove_listener = getattr(client, "remove_price_listener", None)
-            if remove_listener is not None:
-                remove_listener(self._price_listener_id)
-            self._price_listener_id = None
+        # fxserverclientpython 0.1.10 can crash its native job runner during logout.
+        # Event-loop shutdown closes this process-scoped transport instead.
+        self._price_listener_id = None
         self._last_updates.clear()
-        await self._close_client(client)
 
     def _record_price_update(self, event: Any) -> None:
         received_at = time.monotonic()
         for contract in getattr(event, "contract_codes", ()):
             self._last_updates[str(contract).strip().upper()] = received_at
 
-    @staticmethod
-    async def _close_client(client: PriceClient) -> None:
-        logout = getattr(client, "logout", None)
-        if logout is not None:
-            result = logout()
-            if asyncio.iscoroutine(result):
-                await result
-
     async def get_quote(self, contract: str, *, timeout_seconds: float = 10) -> Quote:
         if timeout_seconds <= 0:
             raise ValueError("timeout_seconds must be greater than zero.")
-        last_error: Exception | None = None
-        for attempt in range(self.max_reconnects + 1):
+        if self._client is None:
+            await self.connect()
+        deadline = asyncio.get_running_loop().time() + timeout_seconds
+        while asyncio.get_running_loop().time() < deadline:
             if self._client is None:
-                await self.connect()
-            deadline = asyncio.get_running_loop().time() + timeout_seconds
-            while asyncio.get_running_loop().time() < deadline:
-                if self._client is None:
-                    break
-                try:
-                    price = self._client.get_price_info(contract)
-                except Exception as error:
-                    last_error = error
-                    break
-                last_update = self._last_updates.get(contract.strip().upper())
-                listener_is_fresh = (
-                    self._price_listener_id is None
-                    or last_update is not None
-                    and time.monotonic() - last_update <= timeout_seconds
+                break
+            try:
+                price = self._client.get_price_info(contract)
+            except Exception as error:
+                raise TimeoutError(f"Price transport failed for {contract}.") from error
+            last_update = self._last_updates.get(contract.strip().upper())
+            listener_is_fresh = (
+                self._price_listener_id is None
+                or last_update is not None
+                and time.monotonic() - last_update <= timeout_seconds
+            )
+            if price is not None and listener_is_fresh:
+                return Quote(
+                    contract=contract,
+                    bid=float(price.bid),
+                    ask=float(price.ask),
+                    tag=str(price.tag),
                 )
-                if price is not None and listener_is_fresh:
-                    return Quote(
-                        contract=contract,
-                        bid=float(price.bid),
-                        ask=float(price.ask),
-                        tag=str(price.tag),
-                    )
-                await asyncio.sleep(min(0.1, timeout_seconds))
-            if attempt < self.max_reconnects:
-                await self.connect()
-        message = f"No quote received for {contract} after bounded reconnects."
-        if last_error is not None:
-            raise TimeoutError(message) from last_error
-        raise TimeoutError(message)
+            await asyncio.sleep(min(0.1, timeout_seconds))
+        raise TimeoutError(f"No fresh quote received for {contract}; restart the process.")
 
 
 async def read_quote(config: AppConfig, timeout_seconds: float = 10) -> Quote:

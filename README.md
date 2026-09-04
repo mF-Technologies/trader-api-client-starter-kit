@@ -68,10 +68,15 @@ does not trade:
 trader-api-examples algo-runner --config config.local.yaml
 ```
 
-The runner evaluates each completed bar once, applies a bounded reconnect when a quote is
-unavailable, and writes `runtime/algo-heartbeat.json` for external health monitoring. A
+The runner evaluates each completed bar once and writes `runtime/algo-heartbeat.json` for
+external health monitoring. A
 missing quote, stale bars, invalid contract amount, or unresolved ownership journal stops
 execution instead of submitting without current market-data health.
+
+With `fxserverclientpython` 0.1.10, the WebSocket client is process-scoped. The runner
+fails closed when the price transport becomes unhealthy; an external supervisor may then
+restart the process. It does not call the package's unstable logout path or reconnect in
+the same process.
 
 ## RSI Replay Demo
 

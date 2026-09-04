@@ -94,62 +94,46 @@ async def test_price_session_reuses_one_login_for_multiple_contracts() -> None:
     assert (gold.bid, gold.ask) == (4000, 4001)
     assert (euro.bid, euro.ask) == (1.1, 1.2)
     assert client.login_count == 1
-    assert client.logout_count == 1
+    assert client.logout_count == 0
 
 
 @pytest.mark.asyncio
-async def test_price_session_reconnects_once_after_quote_timeout() -> None:
-    clients = [FakePriceClient(), FakePriceClient()]
-    clients[0].prices.clear()
-
-    async with PriceStreamSession(
-        price_config(), client_factory=lambda: clients.pop(0), max_reconnects=1
-    ) as session:
-        quote = await session.get_quote("LLG", timeout_seconds=0.01)
-
-    assert quote.tag == "LLG-1"
-
-
-@pytest.mark.asyncio
-async def test_price_session_reconnects_after_transport_error() -> None:
-    clients: list[FakePriceClient] = [FailingPriceClient(), FakePriceClient()]
-
-    async with PriceStreamSession(
-        price_config(), client_factory=lambda: clients.pop(0), max_reconnects=1
-    ) as session:
-        quote = await session.get_quote("LLG", timeout_seconds=0.01)
-
-    assert quote.ask == 4001
-
-
-@pytest.mark.asyncio
-async def test_price_session_closes_client_when_login_fails() -> None:
+async def test_price_session_surfaces_login_failure_without_unsafe_logout() -> None:
     client = LoginFailingPriceClient()
 
     with pytest.raises(RuntimeError, match="login failed"):
         async with PriceStreamSession(price_config(), client_factory=lambda: client):
             pass
 
-    assert client.logout_count == 1
+    assert client.logout_count == 0
 
 
 @pytest.mark.asyncio
-async def test_price_session_uses_and_removes_price_update_listener() -> None:
+async def test_price_session_uses_price_update_listener() -> None:
     client = ListeningPriceClient()
 
     async with PriceStreamSession(price_config(), client_factory=lambda: client) as session:
         quote = await session.get_quote("LLG", timeout_seconds=0.1)
 
     assert quote.bid == 4000
-    assert client.removed_listener == "listener-1"
+    assert client.removed_listener == ""
 
 
 @pytest.mark.asyncio
-async def test_price_session_closes_client_when_listener_registration_fails() -> None:
+async def test_price_session_falls_back_to_polling_when_listener_registration_fails() -> None:
     client = ListenerFailingPriceClient()
 
-    with pytest.raises(RuntimeError, match="listener failed"):
-        async with PriceStreamSession(price_config(), client_factory=lambda: client):
-            pass
+    async with PriceStreamSession(price_config(), client_factory=lambda: client) as session:
+        quote = await session.get_quote("LLG", timeout_seconds=0.1)
 
-    assert client.logout_count == 1
+    assert quote.bid == 4000
+    assert client.logout_count == 0
+
+
+@pytest.mark.asyncio
+async def test_price_session_fails_closed_on_transport_error() -> None:
+    client = FailingPriceClient()
+
+    with pytest.raises(TimeoutError, match="transport failed"):
+        async with PriceStreamSession(price_config(), client_factory=lambda: client) as session:
+            await session.get_quote("LLG", timeout_seconds=0.1)
