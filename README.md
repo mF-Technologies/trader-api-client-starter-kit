@@ -40,6 +40,7 @@ trader-api-examples contract-calculator --config config.local.yaml --lots 0.01
 trader-api-examples market-data-monitor --config config.local.yaml
 trader-api-examples order-lifecycle-checker --config config.local.yaml
 trader-api-examples rsi-algo-demo --config config.local.yaml --mode replay
+trader-api-examples algo-runner --config config.local.yaml
 ```
 
 Every command supports `--output human` (default) or `--output json`. Logs go to stderr;
@@ -48,7 +49,31 @@ the result goes to stdout.
 `market-data-monitor` reads both the current quote and completed historical bars. Use
 `--bars-only` when validating Chart Server without opening a price session.
 
-## RSI Algo Demo
+## Algo Runner
+
+`algo-runner` is the supported long-running example for customers moving from the earlier
+algo sample. It keeps one FxServer/Price Agent WebSocket session open for all configured
+instances, uses Realtime Chart Server completed bars for signals, and sends every trading
+mutation through FxServer REST.
+
+Supported strategies are `rsi`, `macd`, and `ema_cross`. Add an `instances` list to
+`config.local.yaml` to run different contracts or strategies through the shared price
+session. Each instance has its own position state and recovery journal. When `instances`
+is omitted, the shared `trading` and `strategy` sections define one `default` instance.
+
+The default `live-observe` mode streams account-specific quotes and evaluates signals but
+does not trade:
+
+```powershell
+trader-api-examples algo-runner --config config.local.yaml
+```
+
+The runner evaluates each completed bar once, applies a bounded reconnect when a quote is
+unavailable, and writes `runtime/algo-heartbeat.json` for external health monitoring. A
+missing quote, stale bars, invalid contract amount, or unresolved ownership journal stops
+execution instead of submitting without current market-data health.
+
+## RSI Replay Demo
 
 The demo uses TA-Lib RSI(14) over completed Realtime Chart Server bars:
 
@@ -58,11 +83,13 @@ The demo uses TA-Lib RSI(14) over completed Realtime Chart Server bars:
 - Hold at most one owned position and complete at most one round trip per run.
 - Do not average, martingale, repeat while inside a zone, or relax thresholds to create a signal.
 
-Modes:
+Modes retained by this focused RSI command:
 
 - `replay`: synthetic fixture, no network, no trading; this is the default.
 - `live-observe`: live completed bars and proposed actions, no trading.
 - `live-execute`: live bars plus real Trader API mutations.
+
+Use `algo-runner` for the shared Price Agent session and multi-strategy workflow.
 
 `NO_SIGNAL` is a normal result. Missing, malformed, stale, or interrupted market data is
 `INCONCLUSIVE` instead.
@@ -77,7 +104,7 @@ Both gates are required before any mutation:
 
 ```powershell
 $env:TRADER_API_ENABLE_LIVE_TRADING = "true"
-trader-api-examples rsi-algo-demo --config config.local.yaml --mode live-execute --execute
+trader-api-examples algo-runner --config config.local.yaml --mode live-execute --execute
 ```
 
 Before submitting, the tool displays a redacted account fingerprint, environment,
@@ -91,10 +118,12 @@ is ambiguous, the tool fails closed and requires inspection in Trader Terminal.
 
 ## Scope
 
-The v1 tools cover WebProxy token exchange/account state, FxServer Trader REST execution,
-Realtime Chart Server completed bars, contract amount calculation, and an RSI reference
-flow. They do not cover Terminal UI automation, CRM, payments, PAMM, MT5, deployment,
-multi-instance bot orchestration, a strategy marketplace, or production operations.
+The examples cover WebProxy token exchange/account state, a shared account-specific price
+session, FxServer Trader REST execution, Realtime Chart Server completed bars, contract
+amount calculation, RSI/MACD/EMA Cross signals, multi-instance orchestration, heartbeat,
+and owned-position recovery. They do not cover Terminal UI automation, CRM, payments,
+PAMM, MT5, service installation, process auto-restart, a strategy marketplace, or
+production operations.
 
 See [SUPPORT.md](SUPPORT.md) for issue routing and [SECURITY.md](SECURITY.md) before sharing
 diagnostics.

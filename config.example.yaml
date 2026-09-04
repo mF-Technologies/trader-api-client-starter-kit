@@ -15,8 +15,29 @@ trading:
   bar_count: 200
 
 strategy:
+  name: rsi
   period_type: 1
   rsi_period: 14
   oversold: 30
   overbought: 70
   exit_level: 50
+  fast_period: 12
+  slow_period: 26
+  signal_period: 9
+
+# Optional. When omitted, algo-runner uses the shared trading and strategy settings above.
+# Every instance shares one price session but owns a separate REST execution journal.
+# instances:
+#   - name: gold-rsi
+#     trading:
+#       contract: LLG
+#       amount: 10
+#     strategy:
+#       name: rsi
+#   - name: euro-ema
+#     trading:
+#       contract: EURUSD
+#     strategy:
+#       name: ema_cross
+#       fast_period: 10
+#       slow_period: 30
