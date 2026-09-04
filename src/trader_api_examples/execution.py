@@ -5,7 +5,8 @@ from pathlib import Path
 from typing import Any, Protocol
 from uuid import uuid4
 
-from .safety import Journal, JournalState, assert_live_execution_enabled
+from .api import ApiError
+from .safety import Journal, JournalState, LiveExecutionBlocked, assert_live_execution_enabled
 
 
 class ExecutionClient(Protocol):
@@ -68,6 +69,12 @@ class ExecutionManager:
                 buy=buy,
                 client_order_id=client_order_id,
             )
+        except ApiError as error:
+            if error.is_definitive_rejection:
+                journal.clear()
+            else:
+                journal.with_state(JournalState.OWNERSHIP_UNCONFIRMED)
+            raise
         except Exception:
             journal.with_state(JournalState.OWNERSHIP_UNCONFIRMED)
             raise
@@ -79,6 +86,13 @@ class ExecutionManager:
 
     async def cleanup(self, *, journal: Journal, execute: bool, client_order_id: int) -> str:
         assert_live_execution_enabled(enabled=self.live_trading_enabled, execute=execute)
+        if journal.path.exists():
+            persisted = Journal.load(journal.path)
+            if persisted.run_id != journal.run_id:
+                raise LiveExecutionBlocked(
+                    "Recovery journal changed before cleanup; refusing to submit."
+                )
+            journal = persisted
         order_ref = journal.order_ref
         if not order_ref:
             journal.with_state(JournalState.OWNERSHIP_UNCONFIRMED)

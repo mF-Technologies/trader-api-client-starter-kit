@@ -168,7 +168,15 @@ instances:
         load_config(config_path)
 
 
-@pytest.mark.parametrize("field,value", [("contract", "''"), ("poll_seconds", "0")])
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("contract", "''"),
+        ("poll_seconds", "0"),
+        ("market_data_retry_seconds", "0"),
+        ("stale_position_grace_seconds", "0"),
+    ],
+)
 def test_load_config_rejects_unsafe_runtime_settings(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, field: str, value: str
 ) -> None:

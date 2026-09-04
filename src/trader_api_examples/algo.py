@@ -40,6 +40,12 @@ class AlgoResult:
     message: str
 
 
+@dataclass(frozen=True)
+class StrategyEvaluation:
+    event: SignalEvent | None
+    indicators: dict[str, float]
+
+
 def calculate_rsi(bars: list[Bar], period: int) -> NDArray[np.float64]:
     closes = np.asarray([bar.close for bar in bars], dtype=np.float64)
     return talib.RSI(closes, timeperiod=period)
@@ -79,41 +85,81 @@ def _line_cross_event(
     )
 
 
+def evaluate_latest_strategy(
+    bars: list[Bar],
+    *,
+    strategy: StrategyConfig,
+    position_side: PositionSide | None,
+) -> StrategyEvaluation:
+    if len(bars) < required_completed_bars(strategy):
+        return StrategyEvaluation(None, {})
+    closes = np.asarray([bar.close for bar in bars], dtype=np.float64)
+    if strategy.name == "rsi":
+        values = talib.RSI(closes, timeperiod=strategy.rsi_period)
+        previous, current = float(values[-2]), float(values[-1])
+        if np.isnan(previous) or np.isnan(current):
+            return StrategyEvaluation(None, {})
+        signal = signal_from_rsi_crossing(
+            previous,
+            current,
+            position_side,
+            oversold=strategy.oversold,
+            overbought=strategy.overbought,
+            exit_level=strategy.exit_level,
+        )
+        event = (
+            SignalEvent(
+                bars[-1].time_ms,
+                signal,
+                round(current, 2),
+                bars[-1].close,
+                strategy.name,
+            )
+            if signal is not Signal.NONE
+            else None
+        )
+        return StrategyEvaluation(event, {"rsi": round(current, 2)})
+    if strategy.name == "ema_cross":
+        fast = talib.EMA(closes, timeperiod=strategy.fast_period)
+        slow = talib.EMA(closes, timeperiod=strategy.slow_period)
+        event = _line_cross_event(
+            bars, fast, slow, strategy=strategy.name, position_side=position_side
+        )
+        return StrategyEvaluation(
+            event,
+            {
+                "ema_fast": round(float(fast[-1]), 6),
+                "ema_slow": round(float(slow[-1]), 6),
+            },
+        )
+    if strategy.name == "macd":
+        macd, signal_line, histogram = talib.MACD(
+            closes,
+            fastperiod=strategy.fast_period,
+            slowperiod=strategy.slow_period,
+            signalperiod=strategy.signal_period,
+        )
+        event = _line_cross_event(
+            bars, macd, signal_line, strategy=strategy.name, position_side=position_side
+        )
+        return StrategyEvaluation(
+            event,
+            {
+                "macd": round(float(macd[-1]), 6),
+                "signal_line": round(float(signal_line[-1]), 6),
+                "histogram": round(float(histogram[-1]), 6),
+            },
+        )
+    raise ValueError(f"Unsupported strategy: {strategy.name}")
+
+
 def latest_strategy_signal(
     bars: list[Bar],
     *,
     strategy: StrategyConfig,
     position_side: PositionSide | None,
 ) -> SignalEvent | None:
-    if len(bars) < required_completed_bars(strategy):
-        return None
-    if strategy.name == "rsi":
-        return latest_signal(
-            bars,
-            rsi_period=strategy.rsi_period,
-            position_side=position_side,
-            oversold=strategy.oversold,
-            overbought=strategy.overbought,
-            exit_level=strategy.exit_level,
-        )
-    closes = np.asarray([bar.close for bar in bars], dtype=np.float64)
-    if strategy.name == "ema_cross":
-        fast = talib.EMA(closes, timeperiod=strategy.fast_period)
-        slow = talib.EMA(closes, timeperiod=strategy.slow_period)
-        return _line_cross_event(
-            bars, fast, slow, strategy=strategy.name, position_side=position_side
-        )
-    if strategy.name == "macd":
-        macd, signal_line, _ = talib.MACD(
-            closes,
-            fastperiod=strategy.fast_period,
-            slowperiod=strategy.slow_period,
-            signalperiod=strategy.signal_period,
-        )
-        return _line_cross_event(
-            bars, macd, signal_line, strategy=strategy.name, position_side=position_side
-        )
-    raise ValueError(f"Unsupported strategy: {strategy.name}")
+    return evaluate_latest_strategy(bars, strategy=strategy, position_side=position_side).event
 
 
 def latest_signal(

@@ -1,3 +1,4 @@
+import asyncio
 from typing import Any
 
 import pytest
@@ -70,6 +71,15 @@ class ListenerFailingPriceClient(FakePriceClient):
         raise RuntimeError("listener failed")
 
 
+class BackgroundDisconnectingPriceClient(FakePriceClient):
+    def trigger_disconnect(self) -> None:
+        async def fail_send() -> None:
+            await asyncio.sleep(0)
+            raise RuntimeError("Client is not connected")
+
+        asyncio.create_task(fail_send())
+
+
 def price_config() -> AppConfig:
     return AppConfig(
         environment="demo",
@@ -136,4 +146,17 @@ async def test_price_session_fails_closed_on_transport_error() -> None:
 
     with pytest.raises(TimeoutError, match="transport failed"):
         async with PriceStreamSession(price_config(), client_factory=lambda: client) as session:
+            await session.get_quote("LLG", timeout_seconds=0.1)
+
+
+@pytest.mark.asyncio
+async def test_price_session_converts_unretrieved_disconnect_task_to_transport_failure() -> None:
+    client = BackgroundDisconnectingPriceClient()
+
+    async with PriceStreamSession(price_config(), client_factory=lambda: client) as session:
+        client.trigger_disconnect()
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+
+        with pytest.raises(TimeoutError, match="background task disconnected"):
             await session.get_quote("LLG", timeout_seconds=0.1)

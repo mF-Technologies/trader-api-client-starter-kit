@@ -3,7 +3,7 @@ from datetime import UTC, datetime
 import httpx
 import pytest
 
-from trader_api_examples.api import TraderApiClient
+from trader_api_examples.api import ApiError, TraderApiClient
 
 
 @pytest.mark.asyncio
@@ -68,3 +68,27 @@ async def test_client_fetches_completed_chart_bars_only() -> None:
         bars = await client.get_completed_bars(contract="EURUSD", period_type=1, count=100, now=now)
 
     assert [bar.time_ms for bar in bars] == [completed_start]
+
+
+@pytest.mark.asyncio
+async def test_http_error_preserves_status_and_rejection_certainty() -> None:
+    def handler(_: httpx.Request) -> httpx.Response:
+        return httpx.Response(400, json={"msg": "Not Available to trade this contract"})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+        client = TraderApiClient(
+            web_proxy_url="https://web.example",
+            fxserver_url="https://fx.example",
+            chart_server_url="https://chart.example",
+            api_key="api-key",  # pragma: allowlist secret
+            http_client=http,
+        )
+        client._access_token = "fx-token"
+
+        with pytest.raises(ApiError) as caught:
+            await client.add_market_deal(
+                contract="LLS", amount=1000, buy=False, client_order_id=123
+            )
+
+    assert caught.value.status_code == 400
+    assert caught.value.is_definitive_rejection is True

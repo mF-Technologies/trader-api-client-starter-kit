@@ -1,4 +1,10 @@
-from trader_api_examples.algo import Outcome, evaluate_replay, latest_signal, latest_strategy_signal
+from trader_api_examples.algo import (
+    Outcome,
+    evaluate_latest_strategy,
+    evaluate_replay,
+    latest_signal,
+    latest_strategy_signal,
+)
 from trader_api_examples.api import Bar
 from trader_api_examples.config import StrategyConfig
 from trader_api_examples.strategy import PositionSide, Signal
@@ -81,3 +87,14 @@ def test_latest_strategy_signal_returns_none_when_history_is_incomplete() -> Non
     )
 
     assert event is None
+
+
+def test_strategy_evaluation_exposes_indicator_values_without_a_signal() -> None:
+    evaluation = evaluate_latest_strategy(
+        bars_from_closes([100 + index * 0.01 for index in range(40)]),
+        strategy=StrategyConfig(),
+        position_side=None,
+    )
+
+    assert evaluation.event is None
+    assert "rsi" in evaluation.indicators

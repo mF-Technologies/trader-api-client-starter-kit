@@ -40,6 +40,8 @@ class TradingConfig:
     max_runtime_seconds: int = 600
     poll_seconds: float = 5.0
     bar_count: int = 200
+    market_data_retry_seconds: float = 30.0
+    stale_position_grace_seconds: float = 120.0
 
 
 @dataclass(frozen=True)
@@ -192,6 +194,14 @@ def _validate_config(config: AppConfig) -> None:
             raise ConfigError(f"{prefix}.trading.max_runtime_seconds must be greater than zero.")
         if trading.poll_seconds <= 0:
             raise ConfigError(f"{prefix}.trading.poll_seconds must be greater than zero.")
+        if trading.market_data_retry_seconds <= 0:
+            raise ConfigError(
+                f"{prefix}.trading.market_data_retry_seconds must be greater than zero."
+            )
+        if trading.stale_position_grace_seconds <= 0:
+            raise ConfigError(
+                f"{prefix}.trading.stale_position_grace_seconds must be greater than zero."
+            )
         if strategy.name not in {"rsi", "macd", "ema_cross"}:
             raise ConfigError(f"{prefix}.strategy.name is not supported: {strategy.name}")
         if strategy.period_type not in range(1, 21):

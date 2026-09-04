@@ -35,6 +35,11 @@ class PriceStreamSession:
         self._client: PriceClient | None = None
         self._price_listener_id: str | None = None
         self._last_updates: dict[str, float] = {}
+        self._loop: asyncio.AbstractEventLoop | None = None
+        self._previous_exception_handler: (
+            Callable[[asyncio.AbstractEventLoop, dict[str, Any]], object] | None
+        ) = None
+        self._background_error: BaseException | None = None
 
     async def __aenter__(self) -> PriceStreamSession:
         await self.connect()
@@ -70,18 +75,27 @@ class PriceStreamSession:
         self._validate()
         if self._client is not None:
             return
-        client = self._make_client()
-        client.init(
-            {
-                "endpoint": self.config.endpoints.fxserver_ws_url,
-                "price_agent_endpoint": self.config.endpoints.price_agent_ws_url,
-                "trade_key": self.config.secrets.trade_key,
-                "webproxy_endpoint": self.config.endpoints.web_proxy_url,
-                "username": self.config.secrets.username,
-                "valid_generated_token": self.config.secrets.api_key,
-            }
-        )
-        await client.login()
+        loop = asyncio.get_running_loop()
+        self._loop = loop
+        self._previous_exception_handler = loop.get_exception_handler()
+        self._background_error = None
+        loop.set_exception_handler(self._handle_loop_exception)
+        try:
+            client = self._make_client()
+            client.init(
+                {
+                    "endpoint": self.config.endpoints.fxserver_ws_url,
+                    "price_agent_endpoint": self.config.endpoints.price_agent_ws_url,
+                    "trade_key": self.config.secrets.trade_key,
+                    "webproxy_endpoint": self.config.endpoints.web_proxy_url,
+                    "username": self.config.secrets.username,
+                    "valid_generated_token": self.config.secrets.api_key,
+                }
+            )
+            await client.login()
+        except BaseException:
+            self._restore_loop_exception_handler()
+            raise
         self._client = client
         self._last_updates.clear()
         add_listener = getattr(client, "add_price_listener", None)
@@ -94,24 +108,56 @@ class PriceStreamSession:
     async def close(self) -> None:
         client, self._client = self._client, None
         if client is None:
+            self._restore_loop_exception_handler()
             return
         # fxserverclientpython 0.1.10 can crash its native job runner during logout.
         # Event-loop shutdown closes this process-scoped transport instead.
         self._price_listener_id = None
         self._last_updates.clear()
+        await asyncio.sleep(0)
+        self._restore_loop_exception_handler()
 
     def _record_price_update(self, event: Any) -> None:
         received_at = time.monotonic()
         for contract in getattr(event, "contract_codes", ()):
             self._last_updates[str(contract).strip().upper()] = received_at
 
+    def _handle_loop_exception(
+        self, loop: asyncio.AbstractEventLoop, context: dict[str, Any]
+    ) -> None:
+        exception = context.get("exception")
+        if isinstance(exception, RuntimeError) and str(exception) == "Client is not connected":
+            self._background_error = exception
+            return
+        if self._previous_exception_handler is not None:
+            self._previous_exception_handler(loop, context)
+        else:
+            loop.default_exception_handler(context)
+
+    def _restore_loop_exception_handler(self) -> None:
+        if (
+            self._loop is not None
+            and self._loop.get_exception_handler() == self._handle_loop_exception
+        ):
+            self._loop.set_exception_handler(self._previous_exception_handler)
+        self._loop = None
+        self._previous_exception_handler = None
+
+    def _raise_background_error(self) -> None:
+        if self._background_error is not None:
+            raise TimeoutError(
+                "Price transport background task disconnected; restart the process."
+            ) from self._background_error
+
     async def get_quote(self, contract: str, *, timeout_seconds: float = 10) -> Quote:
         if timeout_seconds <= 0:
             raise ValueError("timeout_seconds must be greater than zero.")
+        self._raise_background_error()
         if self._client is None:
             await self.connect()
         deadline = asyncio.get_running_loop().time() + timeout_seconds
         while asyncio.get_running_loop().time() < deadline:
+            self._raise_background_error()
             if self._client is None:
                 break
             try:
