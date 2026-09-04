@@ -56,10 +56,12 @@ algo sample. It keeps one FxServer/Price Agent WebSocket session open for all co
 instances, uses Realtime Chart Server completed bars for signals, and sends every trading
 mutation through FxServer REST.
 
-Supported strategies are `rsi`, `macd`, and `ema_cross`. Add an `instances` list to
-`config.local.yaml` to run different contracts or strategies through the shared price
-session. Each instance has its own position state and recovery journal. When `instances`
-is omitted, the shared `trading` and `strategy` sections define one `default` instance.
+RSI is the v1 live-verified strategy. The package also contains `macd` and `ema_cross`
+reference implementations with offline tests, but they are not part of the v1 live-support
+claim. Add an `instances` list to `config.local.yaml` to run RSI against different contracts
+through the shared price session. Each instance has its own position state and recovery
+journal. When `instances` is omitted, the shared `trading` and `strategy` sections define
+one `default` instance.
 
 The default `live-observe` mode streams account-specific quotes and evaluates signals but
 does not trade:
@@ -69,9 +71,20 @@ trader-api-examples algo-runner --config config.local.yaml
 ```
 
 The runner evaluates each completed bar once and writes `runtime/algo-heartbeat.json` for
-external health monitoring. A
-missing quote, stale bars, invalid contract amount, or unresolved ownership journal stops
-execution instead of submitting without current market-data health.
+external health monitoring. Stale or insufficient historical bars pause only the affected
+instance and block new entries while healthy instances continue. The paused instance retries
+ChartServer every `market_data_retry_seconds` and automatically resumes after valid bars
+return. If it owns a position and data remains unavailable for
+`stale_position_grace_seconds`, the runner closes that position through REST and continues
+retrying market data. Shared transport failures, invalid contract amounts, cleanup failures,
+and unresolved ownership journals stop the runner.
+
+Each instance also writes a structured event stream to `runtime/logs/<instance>.jsonl`.
+It records bar evaluations and indicator values, signals, order and liquidation attempts,
+confirmed positions, errors, and shutdown status. Records are flushed immediately and the
+files rotate at 10 MB with five backups. Credentials, tokens, and full price tags are never
+included. These diagnostic logs are separate from the temporary ownership journals used
+for recovery.
 
 With `fxserverclientpython` 0.1.10, the WebSocket client is process-scoped. The runner
 fails closed when the price transport becomes unhealthy; an external supervisor may then

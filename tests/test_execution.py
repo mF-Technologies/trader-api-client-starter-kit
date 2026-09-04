@@ -3,6 +3,7 @@ from typing import Any
 
 import pytest
 
+from trader_api_examples.api import ApiError
 from trader_api_examples.execution import ExecutionManager
 from trader_api_examples.safety import Journal, JournalState
 
@@ -27,6 +28,23 @@ class FakeExecutionClient:
         assert journal.cleanup_client_order_id == 124
         self.position_open = False
         return "liq-43"
+
+
+class RetryCleanupClient(FakeExecutionClient):
+    def __init__(self, journal_path: Path) -> None:
+        super().__init__(journal_path)
+        self.cleanup_ids: list[int] = []
+
+    async def liquidate_market_deal(self, **kwargs: Any) -> str:
+        self.cleanup_ids.append(int(kwargs["client_order_id"]))
+        if len(self.cleanup_ids) > 1:
+            self.position_open = False
+        return "liq-43"
+
+
+class RejectedExecutionClient(FakeExecutionClient):
+    async def add_market_deal(self, **_: Any) -> str:
+        raise ApiError("addDeal returned HTTP 400 (Not Available to trade this contract).", 400)
 
 
 @pytest.mark.asyncio
@@ -56,4 +74,56 @@ async def test_execution_writes_intent_then_confirms_and_cleans_up(
     cleanup_ref = await manager.cleanup(journal=journal, execute=True, client_order_id=124)
 
     assert cleanup_ref == "liq-43"
+    assert not journal_path.exists()
+
+
+@pytest.mark.asyncio
+async def test_cleanup_retry_reuses_the_persisted_client_order_id(tmp_path: Path) -> None:
+    journal_path = tmp_path / "execution.json"
+    client = RetryCleanupClient(journal_path)
+    manager = ExecutionManager(
+        client=client,
+        journal_path=journal_path,
+        live_trading_enabled=True,
+        poll_seconds=0,
+        confirmation_attempts=1,
+    )
+    journal = await manager.open_position(
+        execute=True,
+        account_fingerprint="account-abcd",
+        contract="EURUSD",
+        amount=1000,
+        buy=True,
+        client_order_id=123,
+    )
+
+    with pytest.raises(RuntimeError, match="zero position was not confirmed"):
+        await manager.cleanup(journal=journal, execute=True, client_order_id=124)
+
+    cleanup_ref = await manager.cleanup(journal=journal, execute=True, client_order_id=999)
+
+    assert cleanup_ref == "liq-43"
+    assert client.cleanup_ids == [124, 124]
+    assert not journal_path.exists()
+
+
+@pytest.mark.asyncio
+async def test_definitive_submission_rejection_clears_execution_journal(tmp_path: Path) -> None:
+    journal_path = tmp_path / "execution.json"
+    manager = ExecutionManager(
+        client=RejectedExecutionClient(journal_path),
+        journal_path=journal_path,
+        live_trading_enabled=True,
+    )
+
+    with pytest.raises(ApiError, match="Not Available"):
+        await manager.open_position(
+            execute=True,
+            account_fingerprint="account-abcd",
+            contract="LLS",
+            amount=1000,
+            buy=False,
+            client_order_id=123,
+        )
+
     assert not journal_path.exists()

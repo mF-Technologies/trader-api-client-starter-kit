@@ -8,11 +8,12 @@ endpoints:
   price_agent_ws_url: wss://price-agent.example/websocket
 
 trading:
-  contract: EURUSD
-  amount: 1000
+  # Shared runtime defaults inherited by every instance.
   max_runtime_seconds: 600
   poll_seconds: 5
   bar_count: 200
+  market_data_retry_seconds: 30
+  stale_position_grace_seconds: 120
 
 strategy:
   name: rsi
@@ -25,19 +26,25 @@ strategy:
   slow_period: 26
   signal_period: 9
 
-# Optional. When omitted, algo-runner uses the shared trading and strategy settings above.
-# Every instance shares one price session but owns a separate REST execution journal.
-# instances:
-#   - name: gold-rsi
-#     trading:
-#       contract: LLG
-#       amount: 10
-#     strategy:
-#       name: rsi
-#   - name: euro-ema
-#     trading:
-#       contract: EURUSD
-#     strategy:
-#       name: ema_cross
-#       fast_period: 10
-#       slow_period: 30
+# Each instance shares one price session but owns separate strategy state, logs, and a
+# REST execution journal. Every contract must exist in the account's contract settings
+# and have a valid FxServer chartCode mapping.
+instances:
+  - name: gold-rsi
+    trading:
+      contract: LLG
+      amount: 10
+    strategy:
+      name: rsi
+  - name: euro-rsi
+    trading:
+      contract: EURUSD
+      amount: 1000
+    strategy:
+      name: rsi
+  - name: sterling-rsi
+    trading:
+      contract: GBPUSD
+      amount: 1000
+    strategy:
+      name: rsi
