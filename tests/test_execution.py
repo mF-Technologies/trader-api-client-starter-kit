@@ -47,6 +47,24 @@ class RejectedExecutionClient(FakeExecutionClient):
         raise ApiError("addDeal returned HTTP 400 (Not Available to trade this contract).", 400)
 
 
+class TransientCleanupClient(FakeExecutionClient):
+    def __init__(self, journal_path: Path, error_code: str) -> None:
+        super().__init__(journal_path)
+        self.error_code = error_code
+        self.cleanup_ids: list[int] = []
+
+    async def liquidate_market_deal(self, **kwargs: Any) -> str:
+        self.cleanup_ids.append(int(kwargs["client_order_id"]))
+        if len(self.cleanup_ids) == 1:
+            raise ApiError(
+                f"liquidate returned HTTP 400 ({self.error_code}).",
+                400,
+                self.error_code,
+            )
+        self.position_open = False
+        return "liq-43"
+
+
 @pytest.mark.asyncio
 async def test_execution_writes_intent_then_confirms_and_cleans_up(
     tmp_path: Path,
@@ -126,4 +144,36 @@ async def test_definitive_submission_rejection_clears_execution_journal(tmp_path
             client_order_id=123,
         )
 
+    assert not journal_path.exists()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("error_code", ["710", "934"])
+async def test_cleanup_retries_transient_market_rejection_with_new_persisted_id(
+    tmp_path: Path, error_code: str
+) -> None:
+    journal_path = tmp_path / "execution.json"
+    client = TransientCleanupClient(journal_path, error_code)
+    manager = ExecutionManager(
+        client=client,
+        journal_path=journal_path,
+        live_trading_enabled=True,
+        poll_seconds=0,
+        client_order_id_factory=lambda: 789,
+    )
+    client.position_open = True
+    journal = Journal.begin_submission(
+        path=journal_path,
+        run_id="run-1",
+        account_fingerprint="account-abcd",
+        contract="LLG",
+        side="BUY",
+        amount=10,
+        client_order_id=123,
+    ).with_state(JournalState.OPEN, order_ref="deal-42")
+
+    cleanup_ref = await manager.cleanup(journal=journal, execute=True, client_order_id=456)
+
+    assert cleanup_ref == "liq-43"
+    assert client.cleanup_ids == [456, 789]
     assert not journal_path.exists()

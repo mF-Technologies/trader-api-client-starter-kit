@@ -1,12 +1,20 @@
 from __future__ import annotations
 
 import asyncio
+import secrets
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any, Protocol
 from uuid import uuid4
 
 from .api import ApiError
 from .safety import Journal, JournalState, LiveExecutionBlocked, assert_live_execution_enabled
+
+RETRYABLE_CLEANUP_ERROR_CODES = {"710", "934"}
+
+
+def is_retryable_cleanup_error(error: ApiError) -> bool:
+    return error.error_code in RETRYABLE_CLEANUP_ERROR_CODES
 
 
 class ExecutionClient(Protocol):
@@ -35,12 +43,18 @@ class ExecutionManager:
         live_trading_enabled: bool,
         poll_seconds: float = 1.0,
         confirmation_attempts: int = 10,
+        cleanup_attempts: int = 5,
+        client_order_id_factory: Callable[[], int] | None = None,
     ) -> None:
         self.client = client
         self.journal_path = journal_path
         self.live_trading_enabled = live_trading_enabled
         self.poll_seconds = poll_seconds
         self.confirmation_attempts = confirmation_attempts
+        self.cleanup_attempts = cleanup_attempts
+        self.client_order_id_factory = client_order_id_factory or (
+            lambda: secrets.randbelow(2_147_483_646) + 1
+        )
 
     async def open_position(
         self,
@@ -102,11 +116,27 @@ class ExecutionManager:
             JournalState.CLEANUP_PENDING,
             cleanup_client_order_id=cleanup_client_order_id,
         )
-        cleanup_ref = await self.client.liquidate_market_deal(
-            order_ref=order_ref,
-            amount=journal.amount,
-            client_order_id=cleanup_client_order_id,
-        )
+        cleanup_ref = ""
+        for attempt in range(self.cleanup_attempts):
+            try:
+                cleanup_ref = await self.client.liquidate_market_deal(
+                    order_ref=order_ref,
+                    amount=journal.amount,
+                    client_order_id=cleanup_client_order_id,
+                )
+                break
+            except ApiError as error:
+                if (
+                    not is_retryable_cleanup_error(error)
+                    or attempt + 1 >= self.cleanup_attempts
+                ):
+                    raise
+                cleanup_client_order_id = self.client_order_id_factory()
+                journal = journal.with_state(
+                    JournalState.CLEANUP_PENDING,
+                    cleanup_client_order_id=cleanup_client_order_id,
+                )
+                await asyncio.sleep(self.poll_seconds)
         journal = journal.with_state(JournalState.CLEANUP_PENDING, cleanup_ref=cleanup_ref)
         if not await self._wait_for_position(order_ref, present=False):
             raise RuntimeError("Cleanup was accepted but zero position was not confirmed.")

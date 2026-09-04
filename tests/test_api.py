@@ -91,4 +91,5 @@ async def test_http_error_preserves_status_and_rejection_certainty() -> None:
             )
 
     assert caught.value.status_code == 400
+    assert caught.value.error_code == "Not Available to trade this contract"
     assert caught.value.is_definitive_rejection is True

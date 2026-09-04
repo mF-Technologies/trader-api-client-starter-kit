@@ -23,7 +23,7 @@ from .algo import (
 from .api import PERIOD_DURATION, ApiError, Bar, TraderApiClient
 from .config import AlgoInstanceConfig, AppConfig
 from .contracts import calculate_amount, find_contract_setting, validate_amount
-from .execution import ExecutionManager
+from .execution import ExecutionManager, is_retryable_cleanup_error
 from .output import CommandResult
 from .price_client import PriceStreamSession, Quote, read_quote
 from .runtime import HeartbeatWriter, InstanceEventLog, instance_journal_path
@@ -106,6 +106,7 @@ class _InstanceRuntime:
     history_loaded: bool = False
     market_data_paused_at: float | None = None
     next_market_data_retry_at: float = 0.0
+    next_cleanup_retry_at: float = 0.0
     failure_reason: str | None = None
     events: list[SignalEvent] = field(default_factory=list)
     status: str = "starting"
@@ -497,6 +498,92 @@ async def _cleanup_runtime_state(state: _InstanceRuntime, *, execute: bool) -> N
     state.owned_side = None
 
 
+async def _restore_runtime_state(
+    state: _InstanceRuntime,
+    *,
+    account_fingerprint: str,
+    execute: bool,
+) -> None:
+    manager = state.manager
+    if manager is None or not manager.journal_path.exists():
+        return
+    journal = Journal.load(manager.journal_path)
+    instance = state.config
+    if journal.account_fingerprint != account_fingerprint:
+        raise LiveExecutionBlocked(
+            f"Execution journal for {instance.name} belongs to a different account."
+        )
+    if journal.contract.upper() != instance.trading.contract.upper():
+        raise LiveExecutionBlocked(
+            f"Execution journal for {instance.name} belongs to a different contract."
+        )
+    if journal.state in {JournalState.PENDING_SUBMISSION, JournalState.OWNERSHIP_UNCONFIRMED}:
+        raise LiveExecutionBlocked(
+            f"Execution ownership for {instance.name} is unresolved; run recover first."
+        )
+    if journal.side not in {"BUY", "SELL"} or not journal.order_ref:
+        raise LiveExecutionBlocked(f"Execution journal for {instance.name} is invalid.")
+
+    position = await manager.client.get_position_detail(journal.order_ref)
+    if position is None:
+        journal.clear()
+        state.status = "journal-reconciled"
+        if state.event_log is not None:
+            state.event_log.write(
+                "JOURNAL_RECONCILED",
+                previous_state=journal.state.value,
+                deal_ref=journal.order_ref,
+            )
+        _write_console_status(
+            f"REST:{instance.name}",
+            f"Previous position deal_ref={journal.order_ref} is already closed; "
+            "journal cleared.",
+        )
+        return
+
+    state.journal = journal
+    state.owned_side = PositionSide.LONG if journal.side == "BUY" else PositionSide.SHORT
+    state.status = "position-restored"
+    if state.event_log is not None:
+        state.event_log.write(
+            "POSITION_RESTORED",
+            deal_ref=journal.order_ref,
+            side=journal.side,
+            amount=journal.amount,
+            previous_state=journal.state.value,
+        )
+    _write_console_status(
+        f"REST:{instance.name}",
+        f"Restored owned position deal_ref={journal.order_ref} side={journal.side} "
+        f"amount={journal.amount}",
+    )
+    if journal.state is JournalState.CLEANUP_PENDING:
+        _write_console_status(
+            f"REST:{instance.name}",
+            "Previous cleanup was interrupted; retrying before strategy resumes.",
+        )
+        await _cleanup_runtime_state(state, execute=execute)
+        state.status = "cleanup-reconciled"
+
+
+def _schedule_cleanup_retry(state: _InstanceRuntime, *, error: ApiError, now: float) -> None:
+    state.status = "cleanup-pending"
+    state.next_cleanup_retry_at = now + state.config.trading.market_data_retry_seconds
+    if state.event_log is not None:
+        state.event_log.write(
+            "CLEANUP_RETRY_SCHEDULED",
+            deal_ref=state.journal.order_ref if state.journal else None,
+            error_code=error.error_code,
+            retry_seconds=state.config.trading.market_data_retry_seconds,
+        )
+    _write_console_status(
+        f"REST:{state.config.name}",
+        f"Cleanup temporarily unavailable ({error.error_code}); position remains tracked. "
+        f"Retrying in {state.config.trading.market_data_retry_seconds:g}s. "
+        "Other instances continue.",
+    )
+
+
 async def _pause_runtime_state(
     state: _InstanceRuntime,
     *,
@@ -615,7 +702,18 @@ async def algo_runner(config: AppConfig, mode: str, execute: bool) -> CommandRes
                             state.config.name, state.config.trading.contract
                         ),
                         live_trading_enabled=config.live_trading_enabled,
+                        poll_seconds=min(1.0, state.config.trading.poll_seconds),
                     )
+                    try:
+                        await _restore_runtime_state(
+                            state,
+                            account_fingerprint=fingerprint,
+                            execute=execute,
+                        )
+                    except ApiError as error:
+                        if not is_retryable_cleanup_error(error):
+                            raise
+                        _schedule_cleanup_retry(state, error=error, now=loop.time())
 
             async with PriceStreamSession(config) as price_session:
                 _write_console_status("Price", "Shared price session connected")
@@ -629,6 +727,18 @@ async def algo_runner(config: AppConfig, mode: str, execute: bool) -> CommandRes
                                 continue
                             instance = state.config
                             now = loop.time()
+                            if state.status == "cleanup-pending":
+                                if now < state.next_cleanup_retry_at:
+                                    continue
+                                try:
+                                    await _cleanup_runtime_state(state, execute=execute)
+                                except ApiError as error:
+                                    if not is_retryable_cleanup_error(error):
+                                        raise
+                                    _schedule_cleanup_retry(state, error=error, now=loop.time())
+                                    continue
+                                state.next_cleanup_retry_at = 0.0
+                                state.status = "cleanup-reconciled"
                             if state.deadline is not None and now >= state.deadline:
                                 await _cleanup_runtime_state(state, execute=execute)
                                 if state.market_data_paused_at is None:
