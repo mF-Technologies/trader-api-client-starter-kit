@@ -1,3 +1,4 @@
+import asyncio
 import json
 from datetime import UTC, datetime
 from typing import Any
@@ -137,6 +138,40 @@ class FakePriceSession:
 class FakeHeartbeat:
     def write(self, _: dict[str, str]) -> None:
         pass
+
+
+@pytest.mark.asyncio
+async def test_algo_runner_keeps_running_when_runtime_limit_is_omitted(
+    tmp_path: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = AppConfig(
+        environment="demo",
+        endpoints=EndpointsConfig(
+            web_proxy_url="https://webproxy.example",
+            fxserver_rest_url="https://fxserver.example",
+            chart_server_url="https://chart.example",
+        ),
+        trading=TradingConfig(
+            contract="EURUSD", amount=1000, max_runtime_seconds=None, poll_seconds=0.001
+        ),
+        strategy=StrategyConfig(),
+        secrets=Secrets(api_key="api-key", username="user", trade_key="trade-key"),
+    )
+    client = FakeTraderClient()
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(
+        "trader_api_examples.commands.make_client", lambda *_args, **_kwargs: client
+    )
+    monkeypatch.setattr("trader_api_examples.commands.PriceStreamSession", FakePriceSession)
+    monkeypatch.setattr("trader_api_examples.commands.HeartbeatWriter", lambda: FakeHeartbeat())
+
+    with pytest.raises(TimeoutError):
+        await asyncio.wait_for(
+            algo_runner(config, "live-observe", execute=False), timeout=0.03
+        )
+
+    assert client.bar_calls >= 1
 
 
 @pytest.mark.asyncio

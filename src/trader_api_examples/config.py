@@ -37,7 +37,7 @@ class EndpointsConfig:
 class TradingConfig:
     contract: str = "EURUSD"
     amount: float = 1000.0
-    max_runtime_seconds: int = 600
+    max_runtime_seconds: float | None = None
     poll_seconds: float = 5.0
     bar_count: int = 200
     market_data_retry_seconds: float = 30.0
@@ -190,7 +190,7 @@ def _validate_config(config: AppConfig) -> None:
             raise ConfigError(f"{prefix}.trading.contract must not be empty.")
         if trading.amount <= 0:
             raise ConfigError(f"{prefix}.trading.amount must be greater than zero.")
-        if trading.max_runtime_seconds <= 0:
+        if trading.max_runtime_seconds is not None and trading.max_runtime_seconds <= 0:
             raise ConfigError(f"{prefix}.trading.max_runtime_seconds must be greater than zero.")
         if trading.poll_seconds <= 0:
             raise ConfigError(f"{prefix}.trading.poll_seconds must be greater than zero.")

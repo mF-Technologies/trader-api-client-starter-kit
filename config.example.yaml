@@ -9,8 +9,11 @@ endpoints:
 
 trading:
   # Shared runtime defaults inherited by every instance.
-  max_runtime_seconds: 600
+  # null keeps the algo running until interrupted; set a positive value for bounded QA runs.
+  max_runtime_seconds: null
+  # Refresh quotes and completed bars every five seconds. Each completed bar is evaluated once.
   poll_seconds: 5
+  # Completed candles fetched for indicator warm-up and calculation.
   bar_count: 200
   market_data_retry_seconds: 30
   stale_position_grace_seconds: 120
