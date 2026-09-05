@@ -71,6 +71,35 @@ async def test_client_fetches_completed_chart_bars_only() -> None:
 
 
 @pytest.mark.asyncio
+async def test_completed_bars_cache_chart_code_mapping() -> None:
+    chart_code_requests = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal chart_code_requests
+        if request.url.path == "/chartCode":
+            chart_code_requests += 1
+            return httpx.Response(200, json={"EURUSD": "EURUSD"})
+        return httpx.Response(
+            200,
+            json=[{"time": 0, "open": 1, "high": 1, "low": 1, "close": 1}],
+        )
+
+    now = datetime(2026, 1, 1, 0, 2, tzinfo=UTC)
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+        client = TraderApiClient(
+            web_proxy_url="https://webproxy.example",
+            fxserver_url="https://fxserver.example",
+            chart_server_url="https://chart.example",
+            api_key="api-key",  # pragma: allowlist secret
+            http_client=http,
+        )
+        await client.get_completed_bars(contract="EURUSD", period_type=1, count=100, now=now)
+        await client.get_completed_bars(contract="EURUSD", period_type=1, count=100, now=now)
+
+    assert chart_code_requests == 1
+
+
+@pytest.mark.asyncio
 async def test_http_error_preserves_status_and_rejection_certainty() -> None:
     def handler(_: httpx.Request) -> httpx.Response:
         return httpx.Response(400, json={"msg": "Not Available to trade this contract"})

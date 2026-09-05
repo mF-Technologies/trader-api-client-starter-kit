@@ -80,8 +80,10 @@ continue. The paused instance retries market data every `market_data_retry_secon
 automatically resumes after valid data returns. If it owns a position and data remains unavailable for
 `stale_position_grace_seconds`, the runner closes that position through REST and continues
 retrying market data. Temporary `934` liquidation failures retain the ownership journal and
-retry only the affected instance. Invalid contract amounts and unresolved ownership journals
-stop the worker without automatic restart.
+retry only the affected instance. Transient ChartServer and chart-code HTTP failures (`408`,
+`425`, `429`, and `5xx`) follow the same per-instance retry path; chart-code mappings are
+cached for the worker lifetime. Invalid contract amounts and unresolved ownership journals stop
+the worker without automatic restart.
 
 Each instance also writes a structured event stream to `runtime/logs/<instance>.jsonl`.
 It records bar evaluations and indicator values, signals, order and liquidation attempts,

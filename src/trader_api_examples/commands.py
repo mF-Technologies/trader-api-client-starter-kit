@@ -818,11 +818,23 @@ async def algo_runner(config: AppConfig, mode: str, execute: bool) -> CommandRes
                                     + instance.trading.price_log_interval_seconds
                                 )
                             state.status = "streaming"
-                            bars = await client.get_completed_bars(
-                                contract=instance.trading.contract,
-                                period_type=instance.strategy.period_type,
-                                count=instance.trading.bar_count,
-                            )
+                            try:
+                                bars = await client.get_completed_bars(
+                                    contract=instance.trading.contract,
+                                    period_type=instance.strategy.period_type,
+                                    count=instance.trading.bar_count,
+                                )
+                            except ApiError as error:
+                                if not error.is_transient_response:
+                                    raise
+                                await _pause_runtime_state(
+                                    state,
+                                    status="chart-unavailable",
+                                    message=str(error),
+                                    execute=execute,
+                                    now=loop.time(),
+                                )
+                                continue
                             if _latest_is_stale_for_period(bars, instance.strategy.period_type):
                                 await _pause_runtime_state(
                                     state,
