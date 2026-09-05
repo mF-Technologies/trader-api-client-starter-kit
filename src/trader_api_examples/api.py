@@ -28,6 +28,12 @@ class ApiError(RuntimeError):
             and self.status_code not in {408, 409, 425, 429}
         )
 
+    @property
+    def is_transient_response(self) -> bool:
+        return self.status_code in {408, 425, 429} or (
+            self.status_code is not None and self.status_code >= 500
+        )
+
 
 @dataclass(frozen=True)
 class Bar:
@@ -77,6 +83,7 @@ class TraderApiClient:
         self.chart_server_url = chart_server_url.rstrip("/")
         self._api_key = api_key
         self._access_token = ""
+        self._chart_codes: dict[str, str] | None = None
         self._http = http_client or httpx.AsyncClient(timeout=20)
         self._owns_http = http_client is None
 
@@ -173,9 +180,15 @@ class TraderApiClient:
     ) -> list[Bar]:
         if period_type not in PERIOD_DURATION:
             raise ApiError(f"Unsupported period type: {period_type}")
-        mapping_response = await self._request("GET", f"{self.fxserver_url}/chartCode")
-        mapping = self._object(mapping_response, "chart-code mapping")
-        instrument = mapping.get(contract)
+        if self._chart_codes is None:
+            mapping_response = await self._request("GET", f"{self.fxserver_url}/chartCode")
+            mapping = self._object(mapping_response, "chart-code mapping")
+            self._chart_codes = {
+                str(code): instrument
+                for code, instrument in mapping.items()
+                if isinstance(instrument, str) and instrument
+            }
+        instrument = self._chart_codes.get(contract)
         if not isinstance(instrument, str) or not instrument:
             raise ApiError(f"No chart-code mapping exists for contract {contract}.")
         response = await self._request(

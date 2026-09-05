@@ -96,6 +96,21 @@ class RecoveringTraderClient(FakeTraderClient):
         return [Bar(time_ms=time_ms, open=1, high=1, low=1, close=1)] * 40
 
 
+class RecoveringChartServerClient(FakeTraderClient):
+    def __init__(self) -> None:
+        super().__init__()
+        self.contract_calls: dict[str, int] = {}
+
+    async def get_completed_bars(self, **kwargs: Any) -> list[Bar]:
+        contract = str(kwargs["contract"])
+        attempts = self.contract_calls.get(contract, 0) + 1
+        self.contract_calls[contract] = attempts
+        if contract == "GBPUSD" and attempts <= 2:
+            raise ApiError("/fapi/chartCode returned HTTP 502.", 502)
+        time_ms = int(datetime.now(UTC).timestamp() * 1000) - 60_000
+        return [Bar(time_ms=time_ms, open=1, high=1, low=1, close=1)] * 40
+
+
 class StaleAfterOpenTraderClient(ExecutingTraderClient):
     async def get_completed_bars(self, **_: Any) -> list[Bar]:
         self.bar_calls += 1
@@ -346,7 +361,7 @@ async def test_paused_instance_recovers_when_chart_bars_resume(
     trading = TradingConfig(
         contract="EURUSD",
         amount=1000,
-        max_runtime_seconds=0.05,
+        max_runtime_seconds=0.2,
         poll_seconds=0.001,
         market_data_retry_seconds=0.001,
     )
@@ -840,6 +855,59 @@ async def test_instance_resumes_after_quote_stream_recovers(
     assert result.outcome.value == "NO_SIGNAL"
     assert RecoveringQuotePriceSession.attempts["GBPUSD"] >= 3
     assert result.data["instances"]["default"]["failure_reason"] is None
+
+
+@pytest.mark.asyncio
+async def test_transient_chart_error_pauses_only_the_affected_instance(
+    tmp_path: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    trading = TradingConfig(
+        contract="EURUSD",
+        amount=1000,
+        max_runtime_seconds=0.05,
+        poll_seconds=0.001,
+        market_data_retry_seconds=0.001,
+    )
+    config = AppConfig(
+        environment="demo",
+        endpoints=EndpointsConfig(
+            web_proxy_url="https://webproxy.example",
+            fxserver_rest_url="https://fxserver.example",
+            chart_server_url="https://chart.example",
+        ),
+        trading=trading,
+        strategy=StrategyConfig(),
+        instances=(
+            AlgoInstanceConfig(
+                "recovering",
+                TradingConfig(
+                    contract="GBPUSD",
+                    amount=1000,
+                    max_runtime_seconds=0.05,
+                    poll_seconds=0.001,
+                    market_data_retry_seconds=0.001,
+                ),
+                StrategyConfig(),
+            ),
+            AlgoInstanceConfig("healthy", trading, StrategyConfig()),
+        ),
+        secrets=Secrets(api_key="api-key", username="user", trade_key="trade-key"),
+    )
+    client = RecoveringChartServerClient()
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(
+        "trader_api_examples.commands.make_client", lambda *_args, **_kwargs: client
+    )
+    monkeypatch.setattr("trader_api_examples.commands.PriceStreamSession", FakePriceSession)
+    monkeypatch.setattr("trader_api_examples.commands.HeartbeatWriter", lambda: FakeHeartbeat())
+
+    result = await algo_runner(config, "live-observe", execute=False)
+
+    assert result.outcome.value == "NO_SIGNAL"
+    assert client.contract_calls["GBPUSD"] >= 3
+    assert client.contract_calls["EURUSD"] >= 1
+    assert result.data["instances"]["recovering"]["failure_reason"] is None
 
 
 @pytest.mark.asyncio
