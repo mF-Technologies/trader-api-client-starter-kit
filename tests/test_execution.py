@@ -18,6 +18,12 @@ class FakeExecutionClient:
         self.position_open = True
         return "deal-42"
 
+    async def get_positions(self) -> list[dict[str, Any]]:
+        return []
+
+    async def reconcile_market_deal(self, **_: Any) -> str | None:
+        return "deal-42" if self.position_open else None
+
     async def get_position_detail(self, order_ref: str) -> dict[str, Any] | None:
         assert order_ref == "deal-42"
         return {"ref": order_ref} if self.position_open else None
@@ -45,6 +51,22 @@ class RetryCleanupClient(FakeExecutionClient):
 class RejectedExecutionClient(FakeExecutionClient):
     async def add_market_deal(self, **_: Any) -> str:
         raise ApiError("addDeal returned HTTP 400 (Not Available to trade this contract).", 400)
+
+
+class AmbiguousExecutionClient(FakeExecutionClient):
+    async def add_market_deal(self, **_: Any) -> None:
+        self.position_open = True
+        return None
+
+
+class DuplicateCleanupClient(FakeExecutionClient):
+    async def liquidate_market_deal(self, **_: Any) -> str:
+        self.position_open = False
+        raise ApiError(
+            "liquidate returned HTTP 409 (DUPLICATE_CLIENT_ORDER_ID).",
+            409,
+            "DUPLICATE_CLIENT_ORDER_ID",
+        )
 
 
 class TransientCleanupClient(FakeExecutionClient):
@@ -96,6 +118,30 @@ async def test_execution_writes_intent_then_confirms_and_cleans_up(
 
 
 @pytest.mark.asyncio
+async def test_execution_reconciles_deal_when_submission_has_no_reference(tmp_path: Path) -> None:
+    journal_path = tmp_path / "execution.json"
+    client = AmbiguousExecutionClient(journal_path)
+    manager = ExecutionManager(
+        client=client,
+        journal_path=journal_path,
+        live_trading_enabled=True,
+        poll_seconds=0,
+    )
+
+    journal = await manager.open_position(
+        execute=True,
+        account_fingerprint="account-abcd",
+        contract="USDCAD",
+        amount=100000,
+        buy=True,
+        client_order_id=123,
+    )
+
+    assert journal.state is JournalState.OPEN
+    assert journal.order_ref == "deal-42"
+
+
+@pytest.mark.asyncio
 async def test_cleanup_retry_reuses_the_persisted_client_order_id(tmp_path: Path) -> None:
     journal_path = tmp_path / "execution.json"
     client = RetryCleanupClient(journal_path)
@@ -122,6 +168,37 @@ async def test_cleanup_retry_reuses_the_persisted_client_order_id(tmp_path: Path
 
     assert cleanup_ref == "liq-43"
     assert client.cleanup_ids == [124, 124]
+    assert not journal_path.exists()
+
+
+@pytest.mark.asyncio
+async def test_cleanup_treats_duplicate_client_order_id_as_confirmed_when_position_closed(
+    tmp_path: Path,
+) -> None:
+    journal_path = tmp_path / "execution.json"
+    client = DuplicateCleanupClient(journal_path)
+    client.position_open = True
+    manager = ExecutionManager(
+        client=client,
+        journal_path=journal_path,
+        live_trading_enabled=True,
+        poll_seconds=0,
+        confirmation_attempts=1,
+        cleanup_attempts=1,
+    )
+    journal = Journal.begin_submission(
+        path=journal_path,
+        run_id="run-1",
+        account_fingerprint="account-abcd",
+        contract="EURUSD",
+        side="BUY",
+        amount=1000,
+        client_order_id=123,
+    ).with_state(JournalState.OPEN, order_ref="deal-42")
+
+    cleanup_ref = await manager.cleanup(journal=journal, execute=True, client_order_id=124)
+
+    assert cleanup_ref == "duplicate-confirmed:124"
     assert not journal_path.exists()
 
 

@@ -517,10 +517,11 @@ async def _restore_runtime_state(
     *,
     account_fingerprint: str,
     execute: bool,
-) -> None:
+    now: float,
+) -> bool:
     manager = state.manager
     if manager is None or not manager.journal_path.exists():
-        return
+        return True
     journal = Journal.load(manager.journal_path)
     instance = state.config
     if journal.account_fingerprint != account_fingerprint:
@@ -532,8 +533,28 @@ async def _restore_runtime_state(
             f"Execution journal for {instance.name} belongs to a different contract."
         )
     if journal.state in {JournalState.PENDING_SUBMISSION, JournalState.OWNERSHIP_UNCONFIRMED}:
-        raise LiveExecutionBlocked(
-            f"Execution ownership for {instance.name} is unresolved; run recover first."
+        previous_state = journal.state
+        reconciled = await manager.reconcile_submission(journal=journal)
+        if reconciled is None:
+            _schedule_position_recovery_retry(
+                state,
+                error=ApiError(
+                    f"Execution ownership for {instance.name} is still unresolved.",
+                    503,
+                ),
+                now=now,
+            )
+            return False
+        journal = reconciled
+        if state.event_log is not None:
+            state.event_log.write(
+                "POSITION_RECONCILED",
+                deal_ref=journal.order_ref,
+                previous_state=previous_state.value,
+            )
+        _write_console_status(
+            f"REST:{instance.name}",
+            f"Reconciled submitted position deal_ref={journal.order_ref}; resuming.",
         )
     if journal.side not in {"BUY", "SELL"} or not journal.order_ref:
         raise LiveExecutionBlocked(f"Execution journal for {instance.name} is invalid.")
@@ -554,7 +575,7 @@ async def _restore_runtime_state(
             f"Previous position deal_ref={journal.order_ref} is already closed; "
             "journal cleared.",
         )
-        return
+        return True
 
     state.journal = journal
     state.owned_side = PositionSide.LONG if journal.side == "BUY" else PositionSide.SHORT
@@ -580,6 +601,7 @@ async def _restore_runtime_state(
         )
         await _cleanup_runtime_state(state, execute=execute)
         state.status = "cleanup-reconciled"
+    return True
 
 
 def _api_error_label(error: ApiError) -> str:
@@ -643,10 +665,11 @@ async def _try_restore_runtime_state(
     now: float,
 ) -> bool:
     try:
-        await _restore_runtime_state(
+        restored = await _restore_runtime_state(
             state,
             account_fingerprint=account_fingerprint,
             execute=execute,
+            now=now,
         )
     except ApiError as error:
         if state.journal is None:
@@ -658,7 +681,7 @@ async def _try_restore_runtime_state(
             raise
         _schedule_cleanup_retry(state, error=error, now=now)
         return False
-    return True
+    return restored
 
 
 async def _cleanup_or_schedule_retry(
@@ -1196,6 +1219,7 @@ async def recover(config: AppConfig, execute: bool) -> CommandResult:
     results: list[dict[str, Any]] = []
     blocked = False
     async with make_client(config) as client:
+        manager_by_path: dict[Path, ExecutionManager] = {}
         for path in paths:
             journal = Journal.load(path)
             if journal.account_fingerprint != fingerprint:
@@ -1203,16 +1227,32 @@ async def recover(config: AppConfig, execute: bool) -> CommandResult:
                     "Recovery journal belongs to a different account fingerprint."
                 )
             if not journal.order_ref:
-                journal.with_state(JournalState.OWNERSHIP_UNCONFIRMED)
-                blocked = True
-                results.append(
-                    {
-                        "journal": str(path),
-                        "state": JournalState.OWNERSHIP_UNCONFIRMED.value,
-                        "client_order_id": journal.client_order_id,
-                    }
+                manager = manager_by_path.setdefault(
+                    path,
+                    ExecutionManager(
+                        client=client,
+                        journal_path=path,
+                        live_trading_enabled=config.live_trading_enabled,
+                        poll_seconds=config.trading.market_data_retry_seconds,
+                    ),
                 )
-                continue
+                reconciled = await manager.reconcile_submission(journal=journal)
+                if reconciled is None:
+                    journal.with_state(JournalState.OWNERSHIP_UNCONFIRMED)
+                    blocked = True
+                    results.append(
+                        {
+                            "journal": str(path),
+                            "state": JournalState.OWNERSHIP_UNCONFIRMED.value,
+                            "client_order_id": journal.client_order_id,
+                        }
+                    )
+                    continue
+                journal = reconciled
+            if journal.order_ref is None:
+                raise LiveExecutionBlocked(
+                    f"Execution journal for {path} has no position reference after reconciliation."
+                )
             position = await client.get_position_detail(journal.order_ref)
             if position is None:
                 journal.clear()
@@ -1228,10 +1268,13 @@ async def recover(config: AppConfig, execute: bool) -> CommandResult:
                     }
                 )
                 continue
-            manager = ExecutionManager(
-                client=client,
-                journal_path=path,
-                live_trading_enabled=config.live_trading_enabled,
+            manager = manager_by_path.setdefault(
+                path,
+                ExecutionManager(
+                    client=client,
+                    journal_path=path,
+                    live_trading_enabled=config.live_trading_enabled,
+                ),
             )
             cleanup_ref = await manager.cleanup(
                 journal=journal, execute=True, client_order_id=_client_order_id()

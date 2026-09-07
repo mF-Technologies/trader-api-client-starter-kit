@@ -39,6 +39,167 @@ async def test_client_exchanges_key_and_reads_account_state() -> None:
 
 
 @pytest.mark.asyncio
+async def test_add_market_deal_defers_netting_response_to_reconciliation() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/addDeal":
+            return httpx.Response(200, json={"netting": True, "liquidateRef": "5246"})
+        raise AssertionError(f"Unexpected request: {request.method} {request.url}")
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+        client = TraderApiClient(
+            web_proxy_url="https://web.example",
+            fxserver_url="https://fx.example",
+            chart_server_url="https://chart.example",
+            api_key="api-key",  # pragma: allowlist secret
+            http_client=http,
+        )
+        client._access_token = "fx-token"
+
+        deal_ref = await client.add_market_deal(
+            contract="USDCAD", amount=100000, buy=True, client_order_id=123
+        )
+
+    assert deal_ref is None
+
+
+@pytest.mark.asyncio
+async def test_liquidate_market_deal_accepts_netting_deal_reference() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/liquidate":
+            return httpx.Response(200, json={"netting": True, "dealRef": "5250"})
+        raise AssertionError(f"Unexpected request: {request.method} {request.url}")
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+        client = TraderApiClient(
+            web_proxy_url="https://web.example",
+            fxserver_url="https://fx.example",
+            chart_server_url="https://chart.example",
+            api_key="api-key",  # pragma: allowlist secret
+            http_client=http,
+        )
+        client._access_token = "fx-token"
+
+        cleanup_ref = await client.liquidate_market_deal(
+            order_ref="5247", amount=100000, client_order_id=124
+        )
+
+    assert cleanup_ref == "5250"
+
+
+@pytest.mark.asyncio
+async def test_liquidate_market_deal_allows_missing_reference_for_reconciliation() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/liquidate":
+            return httpx.Response(200, json={"netting": True})
+        raise AssertionError(f"Unexpected request: {request.method} {request.url}")
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+        client = TraderApiClient(
+            web_proxy_url="https://web.example",
+            fxserver_url="https://fx.example",
+            chart_server_url="https://chart.example",
+            api_key="api-key",  # pragma: allowlist secret
+            http_client=http,
+        )
+        client._access_token = "fx-token"
+
+        cleanup_ref = await client.liquidate_market_deal(
+            order_ref="5247", amount=100000, client_order_id=124
+        )
+
+    assert cleanup_ref is None
+
+
+@pytest.mark.asyncio
+async def test_reconcile_market_deal_uses_unique_matching_position() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/getOrderToday":
+            return httpx.Response(
+                200,
+                json={"workingOrders": [], "executedOrders": [], "cancelledOrders": []},
+            )
+        if request.url.path == "/api/getPositionToday":
+            return httpx.Response(
+                200,
+                json={
+                    "positions": [
+                        {
+                            "ref": 5247,
+                            "contract": "USDCAD",
+                            "buySell": True,
+                            "amount": 100000,
+                        }
+                    ]
+                },
+            )
+        if request.url.path == "/positionDetail":
+            assert request.url.params["ref"] == "5247"
+            return httpx.Response(
+                200,
+                json={"orderNo": 5247, "contractCode": "USDCAD", "amount": 100000},
+            )
+        raise AssertionError(f"Unexpected request: {request.method} {request.url}")
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+        client = TraderApiClient(
+            web_proxy_url="https://web.example",
+            fxserver_url="https://fx.example",
+            chart_server_url="https://chart.example",
+            api_key="api-key",  # pragma: allowlist secret
+            http_client=http,
+        )
+        client._access_token = "fx-token"
+
+        deal_ref = await client.reconcile_market_deal(
+            contract="USDCAD",
+            amount=100000,
+            buy=True,
+            client_order_id=123,
+            excluded_refs=(),
+        )
+
+    assert deal_ref == "5247"
+
+
+@pytest.mark.asyncio
+async def test_reconcile_market_deal_rejects_ambiguous_positions() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/getOrderToday":
+            return httpx.Response(200, json={})
+        if request.url.path == "/api/getPositionToday":
+            return httpx.Response(
+                200,
+                json={
+                    "positions": [
+                        {"ref": 5247, "contract": "USDCAD", "buySell": True, "amount": 100000},
+                        {"ref": 5248, "contract": "USDCAD", "buySell": True, "amount": 100000},
+                    ]
+                },
+            )
+        raise AssertionError(f"Unexpected request: {request.method} {request.url}")
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+        client = TraderApiClient(
+            web_proxy_url="https://web.example",
+            fxserver_url="https://fx.example",
+            chart_server_url="https://chart.example",
+            api_key="api-key",  # pragma: allowlist secret
+            http_client=http,
+        )
+        client._access_token = "fx-token"
+
+        deal_ref = await client.reconcile_market_deal(
+            contract="USDCAD",
+            amount=100000,
+            buy=True,
+            client_order_id=123,
+            excluded_refs=(),
+        )
+
+    assert deal_ref is None
+
+
+@pytest.mark.asyncio
 async def test_client_fetches_completed_chart_bars_only() -> None:
     now = datetime(2026, 8, 26, 12, 0, 30, tzinfo=UTC)
     completed_start = int(datetime(2026, 8, 26, 11, 59, tzinfo=UTC).timestamp() * 1000)
