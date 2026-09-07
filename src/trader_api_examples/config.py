@@ -42,6 +42,7 @@ class TradingConfig:
     bar_count: int = 200
     price_log_interval_seconds: float = 30.0
     market_data_retry_seconds: float = 30.0
+    bar_stale_grace_seconds: float = 60.0
     stale_position_grace_seconds: float = 120.0
 
 
@@ -198,6 +199,10 @@ def _validate_config(config: AppConfig) -> None:
         if trading.market_data_retry_seconds <= 0:
             raise ConfigError(
                 f"{prefix}.trading.market_data_retry_seconds must be greater than zero."
+            )
+        if trading.bar_stale_grace_seconds <= 0:
+            raise ConfigError(
+                f"{prefix}.trading.bar_stale_grace_seconds must be greater than zero."
             )
         if trading.price_log_interval_seconds <= 0:
             raise ConfigError(

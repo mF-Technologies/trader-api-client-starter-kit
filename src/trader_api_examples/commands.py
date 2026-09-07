@@ -106,6 +106,7 @@ class _InstanceRuntime:
     history_loaded: bool = False
     market_data_paused_at: float | None = None
     next_market_data_retry_at: float = 0.0
+    next_position_recovery_retry_at: float = 0.0
     next_cleanup_retry_at: float = 0.0
     next_price_log_at: float = 0.0
     failure_reason: str | None = None
@@ -273,11 +274,21 @@ async def order_lifecycle(config: AppConfig, execute: bool) -> CommandResult:
 
 
 def _latest_is_stale(bars: list[Bar], config: AppConfig) -> bool:
+    age_seconds = _latest_bar_age_seconds(bars)
+    return age_seconds is None or age_seconds > _stale_threshold_seconds(
+        config.strategy.period_type,
+        config.trading.bar_stale_grace_seconds,
+    )
+
+
+def _latest_bar_age_seconds(bars: list[Bar]) -> float | None:
     if not bars:
-        return True
-    duration = PERIOD_DURATION[config.strategy.period_type]
-    latest = bars[-1].time_ms / 1000
-    return time.time() - latest > duration.total_seconds() * 2
+        return None
+    return time.time() - bars[-1].time_ms / 1000
+
+
+def _stale_threshold_seconds(period_type: int, grace_seconds: float) -> float:
+    return PERIOD_DURATION[period_type].total_seconds() * 2 + grace_seconds
 
 
 async def live_algo(config: AppConfig, mode: str, execute: bool) -> CommandResult:
@@ -432,11 +443,13 @@ def _runtime_data(state: _InstanceRuntime) -> dict[str, Any]:
     }
 
 
-def _latest_is_stale_for_period(bars: list[Bar], period_type: int) -> bool:
-    if not bars:
-        return True
-    duration = PERIOD_DURATION[period_type]
-    return time.time() - bars[-1].time_ms / 1000 > duration.total_seconds() * 2
+def _latest_is_stale_for_period(
+    bars: list[Bar], period_type: int, grace_seconds: float = 60.0
+) -> bool:
+    age_seconds = _latest_bar_age_seconds(bars)
+    return age_seconds is None or age_seconds > _stale_threshold_seconds(
+        period_type, grace_seconds
+    )
 
 
 def _write_instance_execution_summary(
@@ -529,6 +542,7 @@ async def _restore_runtime_state(
     if position is None:
         journal.clear()
         state.status = "journal-reconciled"
+        state.failure_reason = None
         if state.event_log is not None:
             state.event_log.write(
                 "JOURNAL_RECONCILED",
@@ -545,6 +559,7 @@ async def _restore_runtime_state(
     state.journal = journal
     state.owned_side = PositionSide.LONG if journal.side == "BUY" else PositionSide.SHORT
     state.status = "position-restored"
+    state.failure_reason = None
     if state.event_log is not None:
         state.event_log.write(
             "POSITION_RESTORED",
@@ -567,6 +582,14 @@ async def _restore_runtime_state(
         state.status = "cleanup-reconciled"
 
 
+def _api_error_label(error: ApiError) -> str:
+    if error.error_code:
+        return error.error_code
+    if error.status_code is not None:
+        return f"HTTP {error.status_code}"
+    return "transient API error"
+
+
 def _schedule_cleanup_retry(state: _InstanceRuntime, *, error: ApiError, now: float) -> None:
     state.status = "cleanup-pending"
     state.next_cleanup_retry_at = now + state.config.trading.market_data_retry_seconds
@@ -579,10 +602,63 @@ def _schedule_cleanup_retry(state: _InstanceRuntime, *, error: ApiError, now: fl
         )
     _write_console_status(
         f"REST:{state.config.name}",
-        f"Cleanup temporarily unavailable ({error.error_code}); position remains tracked. "
+        f"Cleanup temporarily unavailable ({_api_error_label(error)}); position remains tracked. "
         f"Retrying in {state.config.trading.market_data_retry_seconds:g}s. "
         "Other instances continue.",
     )
+
+
+def _schedule_position_recovery_retry(
+    state: _InstanceRuntime,
+    *,
+    error: ApiError,
+    now: float,
+) -> None:
+    first_failure = state.status != "position-recovery-pending"
+    state.status = "position-recovery-pending"
+    state.failure_reason = "position-recovery-pending"
+    state.next_position_recovery_retry_at = (
+        now + state.config.trading.market_data_retry_seconds
+    )
+    if state.event_log is not None:
+        state.event_log.write(
+            "POSITION_RECOVERY_PENDING" if first_failure else "POSITION_RECOVERY_RETRY_FAILED",
+            error_code=error.error_code,
+            status_code=error.status_code,
+            retry_seconds=state.config.trading.market_data_retry_seconds,
+        )
+    _write_console_status(
+        f"REST:{state.config.name}",
+        f"Position recovery temporarily unavailable ({_api_error_label(error)}); "
+        "journal retained and no trading will resume until position is confirmed. "
+        f"Retrying in {state.config.trading.market_data_retry_seconds:g}s.",
+    )
+
+
+async def _try_restore_runtime_state(
+    state: _InstanceRuntime,
+    *,
+    account_fingerprint: str,
+    execute: bool,
+    now: float,
+) -> bool:
+    try:
+        await _restore_runtime_state(
+            state,
+            account_fingerprint=account_fingerprint,
+            execute=execute,
+        )
+    except ApiError as error:
+        if state.journal is None:
+            if not error.is_transient_response:
+                raise
+            _schedule_position_recovery_retry(state, error=error, now=now)
+            return False
+        if not is_retryable_cleanup_error(error):
+            raise
+        _schedule_cleanup_retry(state, error=error, now=now)
+        return False
+    return True
 
 
 async def _cleanup_or_schedule_retry(
@@ -722,16 +798,12 @@ async def algo_runner(config: AppConfig, mode: str, execute: bool) -> CommandRes
                         poll_seconds=min(1.0, state.config.trading.poll_seconds),
                         cleanup_attempts=1,
                     )
-                    try:
-                        await _restore_runtime_state(
-                            state,
-                            account_fingerprint=fingerprint,
-                            execute=execute,
-                        )
-                    except ApiError as error:
-                        if not is_retryable_cleanup_error(error):
-                            raise
-                        _schedule_cleanup_retry(state, error=error, now=loop.time())
+                    await _try_restore_runtime_state(
+                        state,
+                        account_fingerprint=fingerprint,
+                        execute=execute,
+                        now=loop.time(),
+                    )
 
             async with PriceStreamSession(config) as price_session:
                 _write_console_status("Price", "Shared price session connected")
@@ -745,6 +817,21 @@ async def algo_runner(config: AppConfig, mode: str, execute: bool) -> CommandRes
                                 continue
                             instance = state.config
                             now = loop.time()
+                            if state.status == "position-recovery-pending":
+                                if now < state.next_position_recovery_retry_at:
+                                    await asyncio.sleep(0.05)
+                                    continue
+                                await _try_restore_runtime_state(
+                                    state,
+                                    account_fingerprint=fingerprint,
+                                    execute=execute,
+                                    now=loop.time(),
+                                )
+                                if state.status in {
+                                    "position-recovery-pending",
+                                    "cleanup-pending",
+                                }:
+                                    continue
                             if state.status == "cleanup-pending":
                                 if now < state.next_cleanup_retry_at:
                                     continue
@@ -835,13 +922,30 @@ async def algo_runner(config: AppConfig, mode: str, execute: bool) -> CommandRes
                                     now=loop.time(),
                                 )
                                 continue
-                            if _latest_is_stale_for_period(bars, instance.strategy.period_type):
+                            latest_bar_age = _latest_bar_age_seconds(bars)
+                            stale_threshold = _stale_threshold_seconds(
+                                instance.strategy.period_type,
+                                instance.trading.bar_stale_grace_seconds,
+                            )
+                            if _latest_is_stale_for_period(
+                                bars,
+                                instance.strategy.period_type,
+                                instance.trading.bar_stale_grace_seconds,
+                            ):
+                                freshness = (
+                                    "missing latest completed bar"
+                                    if latest_bar_age is None
+                                    else (
+                                        f"latest_age_seconds={latest_bar_age:.1f} "
+                                        f"threshold_seconds={stale_threshold:.1f}"
+                                    )
+                                )
                                 await _pause_runtime_state(
                                     state,
                                     status="stale-bars",
                                     message=(
                                         "Completed market data is stale or missing for "
-                                        f"{instance.name}."
+                                        f"{instance.name} ({freshness})."
                                     ),
                                     execute=execute,
                                     now=loop.time(),

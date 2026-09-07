@@ -14,7 +14,7 @@ RETRYABLE_CLEANUP_ERROR_CODES = {"710", "934"}
 
 
 def is_retryable_cleanup_error(error: ApiError) -> bool:
-    return error.error_code in RETRYABLE_CLEANUP_ERROR_CODES
+    return error.error_code in RETRYABLE_CLEANUP_ERROR_CODES or error.is_transient_response
 
 
 class ExecutionClient(Protocol):

@@ -187,6 +187,7 @@ instances:
         ("max_runtime_seconds", "0"),
         ("poll_seconds", "0"),
         ("market_data_retry_seconds", "0"),
+        ("bar_stale_grace_seconds", "0"),
         ("price_log_interval_seconds", "0"),
         ("stale_position_grace_seconds", "0"),
     ],

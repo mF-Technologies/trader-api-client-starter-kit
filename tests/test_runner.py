@@ -75,6 +75,18 @@ class ExecutingTraderClient(FakeTraderClient):
         return "liquidate-1"
 
 
+class TransientPositionDetailTraderClient(ExecutingTraderClient):
+    def __init__(self) -> None:
+        super().__init__()
+        self.position_detail_calls = 0
+
+    async def get_position_detail(self, order_ref: str) -> dict[str, str] | None:
+        self.position_detail_calls += 1
+        if self.position_detail_calls == 1:
+            raise ApiError("position detail returned HTTP 502.", 502)
+        return await super().get_position_detail(order_ref)
+
+
 class PartiallyStaleTraderClient(FakeTraderClient):
     def __init__(self) -> None:
         super().__init__()
@@ -93,6 +105,12 @@ class RecoveringTraderClient(FakeTraderClient):
         self.bar_calls += 1
         age_seconds = 600 if self.bar_calls == 1 else 60
         time_ms = int(datetime.now(UTC).timestamp() * 1000) - age_seconds * 1000
+        return [Bar(time_ms=time_ms, open=1, high=1, low=1, close=1)] * 40
+
+
+class NearStaleTraderClient(FakeTraderClient):
+    async def get_completed_bars(self, **_: Any) -> list[Bar]:
+        time_ms = int(datetime.now(UTC).timestamp() * 1000) - 125_000
         return [Bar(time_ms=time_ms, open=1, high=1, low=1, close=1)] * 40
 
 
@@ -354,6 +372,49 @@ async def test_stale_bars_pause_only_the_affected_instance(
 
 
 @pytest.mark.asyncio
+async def test_m1_bar_within_stale_grace_does_not_pause_instance(
+    tmp_path: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = AppConfig(
+        environment="demo",
+        endpoints=EndpointsConfig(
+            web_proxy_url="https://webproxy.example",
+            fxserver_rest_url="https://fxserver.example",
+            chart_server_url="https://chart.example",
+        ),
+        trading=TradingConfig(
+            contract="EURUSD",
+            amount=1000,
+            max_runtime_seconds=0.02,
+            poll_seconds=0.001,
+            market_data_retry_seconds=0.001,
+            bar_stale_grace_seconds=60,
+        ),
+        strategy=StrategyConfig(),
+        secrets=Secrets(api_key="api-key", username="user", trade_key="trade-key"),
+    )
+    client = NearStaleTraderClient()
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(
+        "trader_api_examples.commands.make_client", lambda *_args, **_kwargs: client
+    )
+    monkeypatch.setattr("trader_api_examples.commands.PriceStreamSession", FakePriceSession)
+    monkeypatch.setattr("trader_api_examples.commands.HeartbeatWriter", lambda: FakeHeartbeat())
+
+    result = await algo_runner(config, "live-observe", execute=False)
+
+    assert result.data["instances"]["default"]["status"] == "runtime-limit"
+    events = [
+        json.loads(line)["event"]
+        for line in (tmp_path / "runtime/logs/default.jsonl")
+        .read_text(encoding="utf-8")
+        .splitlines()
+    ]
+    assert "MARKET_DATA_PAUSED" not in events
+
+
+@pytest.mark.asyncio
 async def test_paused_instance_recovers_when_chart_bars_resume(
     tmp_path: Any,
     monkeypatch: pytest.MonkeyPatch,
@@ -569,6 +630,68 @@ async def test_algo_runner_restores_open_position_from_journal_after_restart(
     assert client.add_count == 0
     assert client.liquidate_count == 1
     assert not path.exists()
+
+
+@pytest.mark.asyncio
+async def test_algo_runner_retries_transient_position_recovery_before_trading(
+    tmp_path: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    trading = TradingConfig(
+        contract="EURUSD",
+        amount=1000,
+        max_runtime_seconds=0.1,
+        poll_seconds=0.001,
+        market_data_retry_seconds=0.001,
+    )
+    config = AppConfig(
+        environment="demo",
+        endpoints=EndpointsConfig(
+            web_proxy_url="https://webproxy.example",
+            fxserver_rest_url="https://fxserver.example",
+            chart_server_url="https://chart.example",
+        ),
+        trading=trading,
+        strategy=StrategyConfig(),
+        secrets=Secrets(api_key="api-key", username="user", trade_key="trade-key"),
+        live_trading_enabled=True,
+    )
+    client = TransientPositionDetailTraderClient()
+    client.position_open = True
+    monkeypatch.chdir(tmp_path)
+    path = instance_journal_path("default", "EURUSD")
+    Journal.begin_submission(
+        path=path,
+        run_id="previous-run",
+        account_fingerprint="key-8c284055dbb5",
+        contract="EURUSD",
+        side="BUY",
+        amount=1000,
+        client_order_id=123,
+    ).with_state(JournalState.OPEN, order_ref="deal-1")
+
+    monkeypatch.setattr(
+        "trader_api_examples.commands.make_client", lambda *_args, **_kwargs: client
+    )
+    monkeypatch.setattr("trader_api_examples.commands.PriceStreamSession", FakePriceSession)
+    monkeypatch.setattr("trader_api_examples.commands.HeartbeatWriter", lambda: FakeHeartbeat())
+
+    result = await algo_runner(config, "live-execute", execute=True)
+
+    assert result.outcome.value == "NO_SIGNAL"
+    assert client.position_detail_calls >= 2
+    assert client.add_count == 0
+    assert client.liquidate_count == 1
+    assert not path.exists()
+    events = [
+        json.loads(line)["event"]
+        for line in (tmp_path / "runtime/logs/default.jsonl")
+        .read_text(encoding="utf-8")
+        .splitlines()
+    ]
+    assert "POSITION_RECOVERY_PENDING" in events
+    assert "POSITION_RESTORED" in events
+    assert "ERROR" not in events
 
 
 @pytest.mark.asyncio
