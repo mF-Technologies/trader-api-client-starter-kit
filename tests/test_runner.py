@@ -48,6 +48,12 @@ class FakeTraderClient:
         time_ms = int(datetime.now(UTC).timestamp() * 1000) - 120_000 + self.bar_calls * 60_000
         return [Bar(time_ms=time_ms, open=1, high=1, low=1, close=1)] * 40
 
+    async def get_positions(self) -> list[dict[str, Any]]:
+        return []
+
+    async def reconcile_market_deal(self, **_: Any) -> str | None:
+        return None
+
     async def add_market_deal(self, **_: Any) -> str:
         raise AssertionError("observe mode must not submit a deal")
 
@@ -64,6 +70,9 @@ class ExecutingTraderClient(FakeTraderClient):
         self.add_count += 1
         self.position_open = True
         return "deal-1"
+
+    async def reconcile_market_deal(self, **_: Any) -> str | None:
+        return "deal-1" if self.position_open else None
 
     async def get_position_detail(self, order_ref: str) -> dict[str, str] | None:
         return {"dealRef": order_ref} if self.position_open else None
@@ -630,6 +639,65 @@ async def test_algo_runner_restores_open_position_from_journal_after_restart(
     assert client.add_count == 0
     assert client.liquidate_count == 1
     assert not path.exists()
+
+
+@pytest.mark.asyncio
+async def test_algo_runner_reconciles_unresolved_submission_from_account_state(
+    tmp_path: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    trading = TradingConfig(
+        contract="EURUSD", amount=1000, max_runtime_seconds=0.1, poll_seconds=0.001
+    )
+    config = AppConfig(
+        environment="demo",
+        endpoints=EndpointsConfig(
+            web_proxy_url="https://webproxy.example",
+            fxserver_rest_url="https://fxserver.example",
+            chart_server_url="https://chart.example",
+        ),
+        trading=trading,
+        strategy=StrategyConfig(),
+        secrets=Secrets(api_key="api-key", username="user", trade_key="trade-key"),
+        live_trading_enabled=True,
+    )
+    client = ExecutingTraderClient()
+    client.position_open = True
+    monkeypatch.chdir(tmp_path)
+    path = instance_journal_path("default", "EURUSD")
+    Journal.begin_submission(
+        path=path,
+        run_id="previous-run",
+        account_fingerprint="key-8c284055dbb5",
+        contract="EURUSD",
+        side="BUY",
+        amount=1000,
+        client_order_id=123,
+    ).with_state(JournalState.OWNERSHIP_UNCONFIRMED)
+
+    def close_signal(*_args: Any, **_kwargs: Any) -> StrategyEvaluation:
+        return StrategyEvaluation(SignalEvent(1, Signal.CLOSE_BUY, 50, 1, "rsi"), {"rsi": 50})
+
+    monkeypatch.setattr(
+        "trader_api_examples.commands.make_client", lambda *_args, **_kwargs: client
+    )
+    monkeypatch.setattr("trader_api_examples.commands.PriceStreamSession", FakePriceSession)
+    monkeypatch.setattr("trader_api_examples.commands.HeartbeatWriter", lambda: FakeHeartbeat())
+    monkeypatch.setattr("trader_api_examples.commands.evaluate_latest_strategy", close_signal)
+
+    result = await algo_runner(config, "live-execute", execute=True)
+
+    assert result.outcome.value == "SUCCESS"
+    assert client.add_count == 0
+    assert client.liquidate_count == 1
+    assert not path.exists()
+    events = [
+        json.loads(line)["event"]
+        for line in (tmp_path / "runtime/logs/default.jsonl")
+        .read_text(encoding="utf-8")
+        .splitlines()
+    ]
+    assert "POSITION_RECONCILED" in events
 
 
 @pytest.mark.asyncio

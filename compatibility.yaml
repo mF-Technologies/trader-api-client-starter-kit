@@ -28,5 +28,5 @@ live_support:
   demo: verified-target
   real_account: compatible-not-yet-verified
 known_gaps:
-  - Position and order query contracts do not expose reliable clientOrderId correlation.
+  - Position and order query contracts do not expose reliable clientOrderId correlation; ambiguous matches remain blocked.
   - Price streaming requires the environment-supplied client library and transport settings.

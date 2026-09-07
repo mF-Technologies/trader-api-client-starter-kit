@@ -145,12 +145,18 @@ On restart, `algo-runner` restores a confirmed open position from its per-instan
 If shutdown was interrupted during cleanup, it retries that cleanup with the persisted
 intent before resuming the strategy. Temporary `710` or `934` cleanup rejections keep only
 that instance in `cleanup-pending`; the position remains tracked and cleanup is retried while
-other instances continue. It never adopts an account position without a matching ownership
-journal.
+other instances continue. A `409 DUPLICATE_CLIENT_ORDER_ID` during cleanup is reconciled by
+checking whether the owned position has disappeared; the runner retains the same client order
+id and never submits a new liquidation request for that ambiguous attempt. It never adopts an
+account position without a matching ownership journal.
 
 The current API prevents duplicate requests with `clientOrderId`, but the current query
 contracts do not expose a reliable `clientOrderId` correlation. When a submission outcome
-is ambiguous, the tool fails closed and requires inspection in Trader Terminal.
+is ambiguous, the tool reconciles read-only order and position state using the client order
+id when available, otherwise an exact contract/side/amount match that excludes positions
+seen before submission. It adopts a reference only when the match is unique and the
+position detail is confirmed; ambiguous ownership retains the journal and blocks that
+instance until it can be reconciled.
 
 ## Scope
 

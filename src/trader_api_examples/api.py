@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -33,6 +34,12 @@ class ApiError(RuntimeError):
         return self.status_code in {408, 425, 429} or (
             self.status_code is not None and self.status_code >= 500
         )
+
+    @property
+    def is_duplicate_client_order_id(self) -> bool:
+        return self.status_code == 409 and (
+            self.error_code or ""
+        ).upper() == "DUPLICATE_CLIENT_ORDER_ID"
 
 
 @dataclass(frozen=True)
@@ -170,6 +177,54 @@ class TraderApiClient:
         self._raise_for_status(response, "position detail")
         return self._object(response, "position detail")
 
+    async def reconcile_market_deal(
+        self,
+        *,
+        contract: str,
+        amount: float,
+        buy: bool,
+        client_order_id: int,
+        excluded_refs: tuple[str, ...] = (),
+    ) -> str | None:
+        """Find an open position created by an ambiguous market-deal response.
+
+        Query contracts do not currently guarantee client-order-id correlation. Prefer an
+        explicit client-order-id match when one is returned, then fall back to one unique
+        position matching the submitted trade while excluding the pre-submit snapshot.
+        """
+        order_state: dict[str, list[dict[str, Any]]] = {}
+        try:
+            order_state = await self.get_orders()
+        except ApiError as error:
+            if not error.is_transient_response:
+                raise
+
+        explicit_candidates = [
+            record
+            for records in order_state.values()
+            for record in records
+            if _record_client_order_id(record) == str(client_order_id)
+            and _record_matches_trade(record, contract=contract, amount=amount, buy=buy)
+        ]
+        explicit_ref = _unique_record_ref(explicit_candidates)
+        if explicit_ref is not None and await self.get_position_detail(explicit_ref) is not None:
+            return explicit_ref
+
+        excluded = set(excluded_refs)
+        positions = await self.get_positions()
+        matching_positions = [
+            position
+            for position in positions
+            if _record_ref(position) not in excluded
+            and _record_matches_trade(position, contract=contract, amount=amount, buy=buy)
+        ]
+        position_ref = _unique_record_ref(matching_positions)
+        if position_ref is None:
+            return None
+        if await self.get_position_detail(position_ref) is None:
+            return None
+        return position_ref
+
     async def get_completed_bars(
         self,
         *,
@@ -226,7 +281,7 @@ class TraderApiClient:
         amount: float,
         buy: bool,
         client_order_id: int,
-    ) -> str:
+    ) -> str | None:
         response = await self._request(
             "POST",
             f"{self.fxserver_url}/addDeal",
@@ -241,13 +296,11 @@ class TraderApiClient:
         )
         payload = self._object(response, "addDeal")
         deal_ref = payload.get("dealRef")
-        if deal_ref is None:
-            raise ApiError("addDeal did not return dealRef.")
-        return str(deal_ref)
+        return str(deal_ref) if deal_ref is not None and str(deal_ref) else None
 
     async def liquidate_market_deal(
         self, *, order_ref: str, amount: float, client_order_id: int
-    ) -> str:
+    ) -> str | None:
         response = await self._request(
             "POST",
             f"{self.fxserver_url}/liquidate",
@@ -260,10 +313,8 @@ class TraderApiClient:
             },
         )
         payload = self._object(response, "liquidate")
-        ref = payload.get("liqRef") or payload.get("liquidateRef")
-        if ref is None:
-            raise ApiError("liquidate did not return a liquidation reference.")
-        return str(ref)
+        ref = payload.get("liqRef") or payload.get("liquidateRef") or payload.get("dealRef")
+        return str(ref) if ref is not None and str(ref) else None
 
     async def _request(self, method: str, url: str, **kwargs: Any) -> httpx.Response:
         try:
@@ -309,3 +360,71 @@ class TraderApiClient:
         if not isinstance(items, list):
             raise ApiError(f"{context} response had an unexpected shape.")
         return [dict(item) for item in items if isinstance(item, dict)]
+
+
+def _record_ref(record: dict[str, Any]) -> str | None:
+    for key in ("ref", "orderNo", "dealRef"):
+        value = record.get(key)
+        if value is not None and str(value):
+            return str(value)
+    return None
+
+
+def _record_client_order_id(record: dict[str, Any]) -> str | None:
+    for key in ("clientOrderId", "client_order_id"):
+        value = record.get(key)
+        if value is not None and str(value):
+            return str(value)
+    return None
+
+
+def _record_matches_trade(
+    record: dict[str, Any], *, contract: str, amount: float, buy: bool
+) -> bool:
+    record_contract = next(
+        (record.get(key) for key in ("contract", "contractCode") if record.get(key) is not None),
+        None,
+    )
+    record_side = next(
+        (record.get(key) for key in ("buySell", "buyOrSell", "buySellType") if key in record),
+        None,
+    )
+    record_amount = next(
+        (
+            record.get(key)
+            for key in ("amount", "buyAmount" if buy else "sellAmount")
+            if key in record
+        ),
+        None,
+    )
+    if not isinstance(record_contract, str) or record_contract.upper() != contract.upper():
+        return False
+    parsed_side = _as_buy_side(record_side)
+    if parsed_side is None or parsed_side is not buy:
+        return False
+    if record_amount is None:
+        return False
+    try:
+        return math.isclose(float(record_amount), amount, rel_tol=1e-9, abs_tol=1e-9)
+    except (TypeError, ValueError):
+        return False
+
+
+def _as_buy_side(value: Any) -> bool | None:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)) and value in {0, 1}:
+        return bool(value)
+    if isinstance(value, str):
+        normalized = value.strip().upper()
+        if normalized in {"BUY", "B", "TRUE", "1"}:
+            return True
+        if normalized in {"SELL", "S", "FALSE", "0"}:
+            return False
+    return None
+
+
+def _unique_record_ref(records: list[dict[str, Any]]) -> str | None:
+    refs = {_record_ref(record) for record in records}
+    refs.discard(None)
+    return next(iter(refs)) if len(refs) == 1 else None
