@@ -76,14 +76,18 @@ external health monitoring. By default it runs until interrupted; set
 controls the completed-candle history used for indicator warm-up, while `poll_seconds` controls
 how often the runner checks quotes and completed bars. Stale quotes, stale bars, or insufficient
 historical bars pause only the affected instance and block new entries while healthy instances
-continue. The paused instance retries market data every `market_data_retry_seconds` and
+continue. A completed bar is considered stale only after two bar periods plus
+`bar_stale_grace_seconds`; this allows a short publication delay without trading on an old bar.
+The paused instance retries market data every `market_data_retry_seconds` and
 automatically resumes after valid data returns. If it owns a position and data remains unavailable for
 `stale_position_grace_seconds`, the runner closes that position through REST and continues
 retrying market data. Temporary `934` liquidation failures retain the ownership journal and
 retry only the affected instance. Transient ChartServer and chart-code HTTP failures (`408`,
 `425`, `429`, and `5xx`) follow the same per-instance retry path; chart-code mappings are
-cached for the worker lifetime. Invalid contract amounts and unresolved ownership journals stop
-the worker without automatic restart.
+cached for the worker lifetime. Transient `positionDetail` failures during startup retain the
+ownership journal and keep that instance in position recovery until the position is confirmed;
+it cannot submit new trades while recovery is pending. Invalid contract amounts and unresolved
+ownership journals stop the worker without automatic restart.
 
 Each instance also writes a structured event stream to `runtime/logs/<instance>.jsonl`.
 It records bar evaluations and indicator values, signals, order and liquidation attempts,
