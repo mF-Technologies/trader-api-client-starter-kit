@@ -41,6 +41,10 @@ class Journal:
     order_ref: str | None = None
     cleanup_ref: str | None = None
     cleanup_client_order_id: int | None = None
+    entry_time_ms: int | None = None
+    stop_price: float | None = None
+    entry_price: float | None = None
+    entry_equity: float | None = None
 
     @classmethod
     def begin_submission(
@@ -53,6 +57,10 @@ class Journal:
         side: str,
         amount: float,
         client_order_id: int,
+        entry_time_ms: int | None = None,
+        stop_price: float | None = None,
+        entry_price: float | None = None,
+        entry_equity: float | None = None,
     ) -> Journal:
         cls.assert_clear(path)
         journal = cls(
@@ -65,6 +73,10 @@ class Journal:
             client_order_id=client_order_id,
             state=JournalState.PENDING_SUBMISSION,
             updated_at=datetime.now(UTC).isoformat(),
+            entry_time_ms=entry_time_ms,
+            stop_price=stop_price,
+            entry_price=entry_price,
+            entry_equity=entry_equity,
         )
         journal.save()
         return journal
@@ -88,6 +100,18 @@ class Journal:
                 int(data["cleanup_client_order_id"])
                 if data.get("cleanup_client_order_id")
                 else None
+            ),
+            entry_time_ms=(
+                int(data["entry_time_ms"])
+                if data.get("entry_time_ms") is not None
+                else None
+            ),
+            stop_price=(float(data["stop_price"]) if data.get("stop_price") is not None else None),
+            entry_price=(
+                float(data["entry_price"]) if data.get("entry_price") is not None else None
+            ),
+            entry_equity=(
+                float(data["entry_equity"]) if data.get("entry_equity") is not None else None
             ),
         )
 
@@ -119,3 +143,74 @@ class Journal:
 
     def clear(self) -> None:
         self.path.unlink(missing_ok=True)
+
+
+@dataclass(frozen=True)
+class LiveRiskState:
+    """Persisted account-level risk state used by the live SMA loop."""
+
+    path: Path
+    account_fingerprint: str
+    contract: str
+    utc_date: str
+    daily_start_equity: float
+    peak_equity: float
+    daily_loss_triggered: bool
+    drawdown_triggered: bool
+    updated_at: str
+
+    @classmethod
+    def initialize(
+        cls,
+        *,
+        path: Path,
+        account_fingerprint: str,
+        contract: str,
+        utc_date: str,
+        equity: float,
+    ) -> LiveRiskState:
+        state = cls(
+            path=path,
+            account_fingerprint=account_fingerprint,
+            contract=contract,
+            utc_date=utc_date,
+            daily_start_equity=equity,
+            peak_equity=equity,
+            daily_loss_triggered=False,
+            drawdown_triggered=False,
+            updated_at=datetime.now(UTC).isoformat(),
+        )
+        state.save()
+        return state
+
+    @classmethod
+    def load(cls, path: Path) -> LiveRiskState:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return cls(
+            path=path,
+            account_fingerprint=str(data["account_fingerprint"]),
+            contract=str(data["contract"]),
+            utc_date=str(data["utc_date"]),
+            daily_start_equity=float(data["daily_start_equity"]),
+            peak_equity=float(data["peak_equity"]),
+            daily_loss_triggered=bool(data["daily_loss_triggered"]),
+            drawdown_triggered=bool(data["drawdown_triggered"]),
+            updated_at=str(data["updated_at"]),
+        )
+
+    def with_updates(self, **updates: Any) -> LiveRiskState:
+        values = asdict(self)
+        values.update(updates)
+        values["path"] = self.path
+        values["updated_at"] = datetime.now(UTC).isoformat()
+        state = LiveRiskState(**values)
+        state.save()
+        return state
+
+    def save(self) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        payload = asdict(self)
+        payload.pop("path")
+        temporary = self.path.with_suffix(f"{self.path.suffix}.tmp")
+        temporary.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        os.replace(temporary, self.path)

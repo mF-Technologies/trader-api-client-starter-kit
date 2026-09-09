@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from math import isclose
 from pathlib import Path
 from typing import Any, Protocol
 from uuid import uuid4
@@ -16,13 +17,15 @@ class ExecutionClient(Protocol):
         amount: float,
         buy: bool,
         client_order_id: int,
-    ) -> str: ...
+    ) -> str | None: ...
+
+    async def get_positions(self) -> list[dict[str, Any]]: ...
 
     async def get_position_detail(self, order_ref: str) -> dict[str, Any] | None: ...
 
     async def liquidate_market_deal(
         self, *, order_ref: str, amount: float, client_order_id: int
-    ) -> str: ...
+    ) -> str | None: ...
 
 
 class ExecutionManager:
@@ -50,8 +53,13 @@ class ExecutionManager:
         amount: float,
         buy: bool,
         client_order_id: int,
+        entry_time_ms: int | None = None,
+        stop_price: float | None = None,
+        entry_price: float | None = None,
+        entry_equity: float | None = None,
     ) -> Journal:
         assert_live_execution_enabled(enabled=self.live_trading_enabled, execute=execute)
+        positions_before = await self.client.get_positions()
         journal = Journal.begin_submission(
             path=self.journal_path,
             run_id=str(uuid4()),
@@ -60,6 +68,10 @@ class ExecutionManager:
             side="BUY" if buy else "SELL",
             amount=amount,
             client_order_id=client_order_id,
+            entry_time_ms=entry_time_ms,
+            stop_price=stop_price,
+            entry_price=entry_price,
+            entry_equity=entry_equity,
         )
         try:
             order_ref = await self.client.add_market_deal(
@@ -71,13 +83,21 @@ class ExecutionManager:
         except Exception:
             journal.with_state(JournalState.OWNERSHIP_UNCONFIRMED)
             raise
-        journal = journal.with_state(JournalState.OPEN, order_ref=order_ref)
-        if not await self._wait_for_position(order_ref, present=True):
+        resolved_order_ref = order_ref or await self._discover_position_reference(
+            positions_before=positions_before,
+            contract=contract,
+            amount=amount,
+        )
+        if not resolved_order_ref:
             journal.with_state(JournalState.OWNERSHIP_UNCONFIRMED)
-            raise RuntimeError("addDeal returned a reference but the position was not confirmed.")
+            raise RuntimeError("addDeal succeeded but no unique position reference was confirmed.")
+        journal = journal.with_state(JournalState.OPEN, order_ref=resolved_order_ref)
+        if not await self._wait_for_position(resolved_order_ref, present=True):
+            journal.with_state(JournalState.OWNERSHIP_UNCONFIRMED)
+            raise RuntimeError("addDeal succeeded but the position was not confirmed.")
         return journal
 
-    async def cleanup(self, *, journal: Journal, execute: bool, client_order_id: int) -> str:
+    async def cleanup(self, *, journal: Journal, execute: bool, client_order_id: int) -> str | None:
         assert_live_execution_enabled(enabled=self.live_trading_enabled, execute=execute)
         order_ref = journal.order_ref
         if not order_ref:
@@ -107,3 +127,51 @@ class ExecutionManager:
             if attempt + 1 < self.confirmation_attempts:
                 await asyncio.sleep(self.poll_seconds)
         return False
+
+    async def _discover_position_reference(
+        self,
+        *,
+        positions_before: list[dict[str, Any]],
+        contract: str,
+        amount: float,
+    ) -> str | None:
+        existing_refs = {
+            reference
+            for position in positions_before
+            if (reference := self._position_reference(position)) is not None
+        }
+        for attempt in range(self.confirmation_attempts):
+            positions = await self.client.get_positions()
+            candidates = [
+                reference
+                for position in positions
+                if (reference := self._position_reference(position)) is not None
+                and reference not in existing_refs
+                and self._position_matches(position, contract=contract, amount=amount)
+            ]
+            if len(candidates) == 1:
+                return candidates[0]
+            if attempt + 1 < self.confirmation_attempts:
+                await asyncio.sleep(self.poll_seconds)
+        return None
+
+    @staticmethod
+    def _position_reference(position: dict[str, Any]) -> str | None:
+        reference = position.get("ref") or position.get("orderRef")
+        return str(reference) if reference is not None else None
+
+    @staticmethod
+    def _position_matches(position: dict[str, Any], *, contract: str, amount: float) -> bool:
+        position_contract = (
+            position.get("contract") or position.get("contractCode") or position.get("market")
+        )
+        raw_amount = position.get("amount")
+        if position_contract is None or raw_amount is None:
+            return False
+        try:
+            position_amount = float(raw_amount)
+        except (TypeError, ValueError):
+            return False
+        return str(position_contract) == contract and isclose(
+            position_amount, amount, rel_tol=1e-9, abs_tol=1e-9
+        )

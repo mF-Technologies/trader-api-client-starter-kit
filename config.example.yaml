@@ -1,18 +1,32 @@
 environment: demo
 
 endpoints:
-  web_proxy_url: https://webproxy.example
-  fxserver_rest_url: https://fxserver.example
-  chart_server_url: https://chart.example
-  fxserver_ws_url: wss://fxserver.example/websocket
-  price_agent_ws_url: wss://price-agent.example/websocket
+  web_proxy_url: https://algotsv22.tradingengine.net/wp
+  fxserver_rest_url: https://algotsv22.tradingengine.net/fapi
+  chart_server_url: https://algotsv22.tradingengine.net/capi
+  fxserver_ws_url: wss://algotsv22.tradingengine.net/fapi/websocket
+  price_agent_ws_url: wss://algotsv22.tradingengine.net/fapi/websocket
 
 trading:
-  contract: EURUSD
+  # This account uses LLG as its XAUUSD/London Gold contract code.
+  contract: LLG
   amount: 1000
+  # API amount represented by one lot for lot-based replay commission conversion.
+  amount_per_lot: 1
+  # Flat signal-search budget; an open trade uses max_holding_hours instead.
   max_runtime_seconds: 600
+  max_holding_hours: 120
+  # Live risk limits, expressed as percentages of account equity.
+  max_trade_loss_pct: 1
+  max_daily_loss_pct: 2
+  max_drawdown_pct: 10
   poll_seconds: 5
   bar_count: 200
+  # Observed LLG/XAUUSD session break in UTC. Verify this against the account schedule.
+  market_data_daily_break_start_utc: "23:00"
+  market_data_daily_break_end_utc: "01:00"
+  # Add broker-specific full-day closures as ISO dates when known.
+  market_data_closed_dates_utc: []
 
 strategy:
   period_type: 1
@@ -20,3 +34,19 @@ strategy:
   oversold: 30
   overbought: 70
   exit_level: 50
+  # 1 = one-minute, 2 = hourly, 3 = daily
+  sma_period_type: 1
+  sma_fast_period: 20
+  sma_slow_period: 50
+  atr_period: 14
+  sma_exit_buffer_atr: 0
+  atr_stop_multiple: 2
+  commission_rate: 0
+  slippage_bps: 0
+  # Replay-only cost assumptions. Values are not fetched from the account.
+  commission_per_unit: 0
+  # Total entry-plus-exit commission for one lot, in account currency.
+  commission_round_turn_per_lot: 0
+  spread_bps: 0
+  financing_bps_per_day: 0
+  market_impact_bps: 0

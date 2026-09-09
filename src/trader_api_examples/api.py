@@ -59,6 +59,7 @@ class TraderApiClient:
         self.chart_server_url = chart_server_url.rstrip("/")
         self._api_key = api_key
         self._access_token = ""
+        self._last_liquidation_payload: dict[str, Any] | None = None
         self._http = http_client or httpx.AsyncClient(timeout=20)
         self._owns_http = http_client is None
 
@@ -145,6 +146,11 @@ class TraderApiClient:
         self._raise_for_status(response, "position detail")
         return self._object(response, "position detail")
 
+    @property
+    def last_liquidation_payload(self) -> dict[str, Any] | None:
+        """Return the raw response from the most recent liquidation request."""
+        return dict(self._last_liquidation_payload) if self._last_liquidation_payload else None
+
     async def get_completed_bars(
         self,
         *,
@@ -195,7 +201,7 @@ class TraderApiClient:
         amount: float,
         buy: bool,
         client_order_id: int,
-    ) -> str:
+    ) -> str | None:
         response = await self._request(
             "POST",
             f"{self.fxserver_url}/addDeal",
@@ -210,13 +216,13 @@ class TraderApiClient:
         )
         payload = self._object(response, "addDeal")
         deal_ref = payload.get("dealRef")
-        if deal_ref is None:
-            raise ApiError("addDeal did not return dealRef.")
-        return str(deal_ref)
+        # Some demo responses confirm HTTP success but omit a deal reference.
+        # The execution manager can reconcile the new position from position state.
+        return str(deal_ref) if deal_ref is not None else None
 
     async def liquidate_market_deal(
         self, *, order_ref: str, amount: float, client_order_id: int
-    ) -> str:
+    ) -> str | None:
         response = await self._request(
             "POST",
             f"{self.fxserver_url}/liquidate",
@@ -229,10 +235,11 @@ class TraderApiClient:
             },
         )
         payload = self._object(response, "liquidate")
+        self._last_liquidation_payload = payload
         ref = payload.get("liqRef") or payload.get("liquidateRef")
-        if ref is None:
-            raise ApiError("liquidate did not return a liquidation reference.")
-        return str(ref)
+        # Some demo responses confirm HTTP success but omit a liquidation reference.
+        # Position disappearance is the authoritative confirmation in that case.
+        return str(ref) if ref is not None else None
 
     async def _request(self, method: str, url: str, **kwargs: Any) -> httpx.Response:
         try:

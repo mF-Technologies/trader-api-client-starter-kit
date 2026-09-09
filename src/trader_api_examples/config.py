@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass, field
+from datetime import date, datetime
+from math import isfinite
 from pathlib import Path
 from typing import Any
 
@@ -35,11 +37,24 @@ class EndpointsConfig:
 
 @dataclass(frozen=True)
 class TradingConfig:
-    contract: str = "EURUSD"
+    contract: str = "LLG"
     amount: float = 1000.0
+    # API amount represented by one lot when converting lot-based replay costs.
+    amount_per_lot: float = 1.0
+    # Applies while flat and waiting for a new entry. An open trade uses max_holding_hours.
     max_runtime_seconds: int = 600
+    max_holding_hours: float | None = 120.0
+    # Live risk controls use account equity and are persisted across restarts.
+    max_trade_loss_pct: float | None = 1.0
+    max_daily_loss_pct: float | None = 2.0
+    max_drawdown_pct: float | None = 10.0
     poll_seconds: float = 5.0
     bar_count: int = 200
+    # These are the session hours observed in the uploaded LLG/XAUUSD H1 history.
+    # They are configurable because the broker's schedule is an account-level input.
+    market_data_daily_break_start_utc: str | None = "23:00"
+    market_data_daily_break_end_utc: str | None = "01:00"
+    market_data_closed_dates_utc: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -49,6 +64,19 @@ class StrategyConfig:
     oversold: float = 30.0
     overbought: float = 70.0
     exit_level: float = 50.0
+    sma_period_type: int = 3
+    sma_fast_period: int = 20
+    sma_slow_period: int = 50
+    atr_period: int = 14
+    sma_exit_buffer_atr: float = 0.0
+    atr_stop_multiple: float = 2.0
+    commission_rate: float = 0.0
+    slippage_bps: float = 0.0
+    commission_per_unit: float = 0.0
+    commission_round_turn_per_lot: float = 0.0
+    spread_bps: float = 0.0
+    financing_bps_per_day: float = 0.0
+    market_impact_bps: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -113,6 +141,13 @@ def load_config(path: Path, *, require_api_key: bool = True) -> AppConfig:
     trading = _mapping(data.get("trading"), "trading")
     strategy = _mapping(data.get("strategy"), "strategy")
 
+    closed_dates = trading.get("market_data_closed_dates_utc", ())
+    if closed_dates is None:
+        closed_dates = ()
+    elif not isinstance(closed_dates, (list, tuple)):
+        raise ConfigError("trading.market_data_closed_dates_utc must be a list.")
+    trading["market_data_closed_dates_utc"] = tuple(str(value).strip() for value in closed_dates)
+
     environment = str(data.get("environment", "")).strip().lower()
     if environment not in {"demo", "live"}:
         raise ConfigError("environment must be 'demo' or 'live'.")
@@ -139,11 +174,79 @@ def load_config(path: Path, *, require_api_key: bool = True) -> AppConfig:
 def _validate_config(config: AppConfig) -> None:
     if config.trading.amount <= 0:
         raise ConfigError("trading.amount must be greater than zero.")
+    if not isfinite(config.trading.amount_per_lot) or config.trading.amount_per_lot <= 0:
+        raise ConfigError("trading.amount_per_lot must be finite and greater than zero.")
     if config.trading.max_runtime_seconds <= 0:
         raise ConfigError("trading.max_runtime_seconds must be greater than zero.")
+    if config.trading.max_holding_hours is not None and (
+        not isfinite(config.trading.max_holding_hours) or config.trading.max_holding_hours <= 0
+    ):
+        raise ConfigError("trading.max_holding_hours must be finite and greater than zero.")
+    for name, limit in (
+        ("max_trade_loss_pct", config.trading.max_trade_loss_pct),
+        ("max_daily_loss_pct", config.trading.max_daily_loss_pct),
+        ("max_drawdown_pct", config.trading.max_drawdown_pct),
+    ):
+        if limit is not None and (not isfinite(limit) or limit <= 0 or limit > 100):
+            raise ConfigError(f"trading.{name} must be between zero and 100 when set.")
+    start = config.trading.market_data_daily_break_start_utc
+    end = config.trading.market_data_daily_break_end_utc
+    if (start is None) != (end is None):
+        raise ConfigError(
+            "trading.market_data_daily_break_start_utc and "
+            "market_data_daily_break_end_utc must be set together."
+        )
+    for name, clock_value in (
+        ("market_data_daily_break_start_utc", start),
+        ("market_data_daily_break_end_utc", end),
+    ):
+        if clock_value is not None:
+            try:
+                datetime.strptime(clock_value, "%H:%M")
+            except ValueError as error:
+                raise ConfigError(f"trading.{name} must use HH:MM UTC format.") from error
+    for closed_date in config.trading.market_data_closed_dates_utc:
+        try:
+            date.fromisoformat(closed_date)
+        except ValueError as error:
+            raise ConfigError(
+                "trading.market_data_closed_dates_utc must contain ISO dates."
+            ) from error
     if config.trading.bar_count < config.strategy.rsi_period + 2:
         raise ConfigError("trading.bar_count must provide enough completed bars for RSI.")
     if not 0 < config.strategy.oversold < config.strategy.exit_level:
         raise ConfigError("strategy.oversold must be below strategy.exit_level.")
     if not config.strategy.exit_level < config.strategy.overbought < 100:
         raise ConfigError("strategy.overbought must be above strategy.exit_level.")
+    if config.strategy.sma_period_type not in {1, 2, 3}:
+        raise ConfigError("strategy.sma_period_type must be 1 (minute), 2 (hourly), or 3 (daily).")
+    if config.strategy.sma_fast_period <= 0:
+        raise ConfigError("strategy.sma_fast_period must be greater than zero.")
+    if config.strategy.sma_fast_period >= config.strategy.sma_slow_period:
+        raise ConfigError("strategy.sma_fast_period must be below sma_slow_period.")
+    if config.strategy.atr_period <= 0:
+        raise ConfigError("strategy.atr_period must be greater than zero.")
+    if config.strategy.sma_exit_buffer_atr < 0:
+        raise ConfigError("strategy.sma_exit_buffer_atr must not be negative.")
+    if config.strategy.atr_stop_multiple <= 0:
+        raise ConfigError("strategy.atr_stop_multiple must be greater than zero.")
+    if config.strategy.commission_rate < 0:
+        raise ConfigError("strategy.commission_rate must not be negative.")
+    if not 0 <= config.strategy.slippage_bps < 10_000:
+        raise ConfigError("strategy.slippage_bps must be between zero and 10000.")
+    if config.strategy.commission_per_unit < 0:
+        raise ConfigError("strategy.commission_per_unit must not be negative.")
+    if (
+        not isfinite(config.strategy.commission_round_turn_per_lot)
+        or config.strategy.commission_round_turn_per_lot < 0
+    ):
+        raise ConfigError(
+            "strategy.commission_round_turn_per_lot must be finite and not negative."
+        )
+    for name, cost_value in (
+        ("spread_bps", config.strategy.spread_bps),
+        ("financing_bps_per_day", config.strategy.financing_bps_per_day),
+        ("market_impact_bps", config.strategy.market_impact_bps),
+    ):
+        if not 0 <= cost_value < 10_000:
+            raise ConfigError(f"strategy.{name} must be between zero and 10000.")

@@ -68,3 +68,52 @@ async def test_client_fetches_completed_chart_bars_only() -> None:
         bars = await client.get_completed_bars(contract="EURUSD", period_type=1, count=100, now=now)
 
     assert [bar.time_ms for bar in bars] == [completed_start]
+
+
+@pytest.mark.asyncio
+async def test_client_accepts_successful_liquidation_without_reference() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/tokens/auth":
+            return httpx.Response(200, json={"access_token": "fx-token"})
+        if request.url.path == "/liquidate":
+            return httpx.Response(200, json={"success": True})
+        raise AssertionError(f"Unexpected request: {request.method} {request.url}")
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+        client = TraderApiClient(
+            web_proxy_url="https://web.example",
+            fxserver_url="https://fx.example",
+            chart_server_url="https://chart.example",
+            api_key="api-key",  # pragma: allowlist secret
+            http_client=http,
+        )
+        liquidation_ref = await client.liquidate_market_deal(
+            order_ref="deal-42", amount=10, client_order_id=123
+        )
+
+    assert liquidation_ref is None
+    assert client.last_liquidation_payload == {"success": True}
+
+
+@pytest.mark.asyncio
+async def test_client_accepts_successful_deal_without_reference() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/tokens/auth":
+            return httpx.Response(200, json={"access_token": "fx-token"})
+        if request.url.path == "/addDeal":
+            return httpx.Response(200, json={"success": True})
+        raise AssertionError(f"Unexpected request: {request.method} {request.url}")
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+        client = TraderApiClient(
+            web_proxy_url="https://web.example",
+            fxserver_url="https://fx.example",
+            chart_server_url="https://chart.example",
+            api_key="api-key",  # pragma: allowlist secret
+            http_client=http,
+        )
+        deal_ref = await client.add_market_deal(
+            contract="EURUSD", amount=10, buy=True, client_order_id=123
+        )
+
+    assert deal_ref is None

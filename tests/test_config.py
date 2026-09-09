@@ -2,7 +2,59 @@ from pathlib import Path
 
 import pytest
 
-from trader_api_examples.config import ConfigError, load_config
+from trader_api_examples.config import ConfigError, TradingConfig, load_config
+
+
+def test_default_research_contract_is_llg() -> None:
+    assert TradingConfig().contract == "LLG"
+    assert TradingConfig().amount_per_lot == 1.0
+    assert TradingConfig().max_runtime_seconds == 600
+    assert TradingConfig().max_holding_hours == 120.0
+    assert TradingConfig().max_trade_loss_pct == 1.0
+    assert TradingConfig().max_daily_loss_pct == 2.0
+    assert TradingConfig().max_drawdown_pct == 10.0
+
+
+def test_load_config_rejects_nonpositive_holding_time(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        "environment: demo\ntrading:\n  max_holding_hours: 0\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("TRADER_API_KEY", "api-key")  # pragma: allowlist secret
+
+    with pytest.raises(ConfigError, match="max_holding_hours"):
+        load_config(config_path)
+
+
+def test_load_config_rejects_invalid_live_risk_limit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        "environment: demo\ntrading:\n  max_drawdown_pct: 101\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("TRADER_API_KEY", "api-key")  # pragma: allowlist secret
+
+    with pytest.raises(ConfigError, match="max_drawdown_pct"):
+        load_config(config_path)
+
+
+def test_load_config_rejects_invalid_round_turn_commission(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        "environment: demo\nstrategy:\n  commission_round_turn_per_lot: -1\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("TRADER_API_KEY", "api-key")  # pragma: allowlist secret
+
+    with pytest.raises(ConfigError, match="commission_round_turn_per_lot"):
+        load_config(config_path)
 
 
 def test_load_config_keeps_strategy_settings_and_resolves_secrets_from_environment(
@@ -17,7 +69,7 @@ endpoints:
   fxserver_rest_url: https://fxserver.example
   chart_server_url: https://chart.example
 trading:
-  contract: EURUSD
+  contract: LLG
   amount: 1000
   max_runtime_seconds: 600
 strategy:
@@ -34,9 +86,33 @@ strategy:
     config = load_config(config_path)
 
     assert config.environment == "demo"
-    assert config.trading.contract == "EURUSD"
+    assert config.trading.contract == "LLG"
     assert config.trading.amount == 1000
     assert config.secrets.api_key == "secret-api-key"  # pragma: allowlist secret
+
+
+def test_load_config_accepts_market_data_session_settings(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config_path = tmp_path / "config.local.yaml"
+    config_path.write_text(
+        """
+environment: demo
+trading:
+  market_data_daily_break_start_utc: "23:00"
+  market_data_daily_break_end_utc: "01:00"
+  market_data_closed_dates_utc:
+    - 2026-12-25
+""".strip(),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("TRADER_API_KEY", "secret-api-key")  # pragma: allowlist secret
+
+    config = load_config(config_path)
+
+    assert config.trading.market_data_daily_break_start_utc == "23:00"
+    assert config.trading.market_data_daily_break_end_utc == "01:00"
+    assert config.trading.market_data_closed_dates_utc == ("2026-12-25",)
 
 
 def test_load_config_reads_dotenv_local_next_to_config(
@@ -107,3 +183,48 @@ def test_load_config_reports_missing_environment_variable_name_only(tmp_path: Pa
         load_config(config_path)
 
     assert "secret" not in str(error.value).lower()
+
+
+def test_load_config_accepts_one_minute_sma_testing_period(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        "environment: demo\nstrategy:\n  sma_period_type: 1\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("TRADER_API_KEY", "api-key")  # pragma: allowlist secret
+
+    config = load_config(config_path)
+
+    assert config.strategy.sma_period_type == 1
+
+
+def test_load_config_accepts_hourly_sma_testing_period(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        "environment: demo\nstrategy:\n  sma_period_type: 2\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("TRADER_API_KEY", "api-key")  # pragma: allowlist secret
+
+    config = load_config(config_path)
+
+    assert config.strategy.sma_period_type == 2
+
+
+def test_load_config_rejects_unsupported_sma_period(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        "environment: demo\nstrategy:\n  sma_period_type: 4\n",
+        encoding="utf-8",
+    )
+
+    monkeypatch.setenv("TRADER_API_KEY", "api-key")  # pragma: allowlist secret
+
+    with pytest.raises(ConfigError, match="sma_period_type"):
+        load_config(config_path)
