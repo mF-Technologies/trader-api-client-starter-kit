@@ -25,6 +25,11 @@ class Quote:
     tag: str
 
 
+def _is_quickjs_exception(error: BaseException) -> bool:
+    error_type = type(error)
+    return error_type.__module__ == "_quickjs" and error_type.__name__ == "JSException"
+
+
 class PriceClient(Protocol):
     def init(self, config: dict[str, str]) -> None: ...
     async def login(self) -> Any: ...
@@ -155,6 +160,9 @@ class PriceStreamSession:
         if isinstance(exception, RuntimeError) and str(exception) == "Client is not connected":
             self._background_error = exception
             return
+        if isinstance(exception, BaseException) and _is_quickjs_exception(exception):
+            self._background_error = exception
+            return
         if self._previous_exception_handler is not None:
             self._previous_exception_handler(loop, context)
         else:
@@ -171,7 +179,9 @@ class PriceStreamSession:
 
     def _raise_background_error(self) -> None:
         if self._background_error is not None:
-            if str(self._background_error) == "Client is not connected":
+            if _is_quickjs_exception(self._background_error):
+                message = "Price transport JavaScript runtime failed; restart the process."
+            elif str(self._background_error) == "Client is not connected":
                 message = "Price transport background task disconnected; restart the process."
             else:
                 message = "Price transport reported a disconnect; restart the process."

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import asyncio
 import math
+import time
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -74,6 +76,8 @@ PERIOD_DURATION = {
     20: timedelta(hours=12),
 }
 
+TOKEN_REFRESH_SKEW_SECONDS = 30.0
+
 
 class TraderApiClient:
     def __init__(
@@ -90,6 +94,8 @@ class TraderApiClient:
         self.chart_server_url = chart_server_url.rstrip("/")
         self._api_key = api_key
         self._access_token = ""
+        self._access_token_expires_at: float | None = None
+        self._access_token_lock = asyncio.Lock()
         self._chart_codes: dict[str, str] | None = None
         self._http = http_client or httpx.AsyncClient(timeout=20)
         self._owns_http = http_client is None
@@ -109,20 +115,26 @@ class TraderApiClient:
             else f"{self.web_proxy_url}/api"
         )
 
-    async def access_token(self) -> str:
-        if self._access_token:
+    async def access_token(self, *, force: bool = False) -> str:
+        if not force and self._access_token_is_fresh():
             return self._access_token
-        response = await self._request(
-            "POST",
-            f"{self._web_api}/tokens/auth",
-            headers={"Authorization": f"Bearer {self._api_key}"},
-        )
-        payload = self._object(response, "token exchange")
-        token = payload.get("access_token")
-        if not isinstance(token, str) or not token:
-            raise ApiError("Token exchange response did not contain access_token.")
-        self._access_token = token
-        return token
+
+        async with self._access_token_lock:
+            if not force and self._access_token_is_fresh():
+                return self._access_token
+            response = await self._request(
+                "POST",
+                f"{self._web_api}/tokens/auth",
+                headers={"Authorization": f"Bearer {self._api_key}"},
+                retry_unauthorized=False,
+            )
+            payload = self._object(response, "token exchange")
+            token = payload.get("access_token")
+            if not isinstance(token, str) or not token:
+                raise ApiError("Token exchange response did not contain access_token.")
+            self._access_token = token
+            self._access_token_expires_at = self._token_expiry(payload)
+            return token
 
     async def _auth_headers(self) -> dict[str, str]:
         return {"Authorization": f"Bearer {await self.access_token()}"}
@@ -167,13 +179,17 @@ class TraderApiClient:
         return result
 
     async def get_position_detail(self, order_ref: str) -> dict[str, Any] | None:
-        response = await self._http.get(
-            f"{self.fxserver_url}/positionDetail",
-            headers=await self._auth_headers(),
-            params={"ref": order_ref},
-        )
-        if response.status_code == 404:
-            return None
+        try:
+            response = await self._request(
+                "GET",
+                f"{self.fxserver_url}/positionDetail",
+                headers=await self._auth_headers(),
+                params={"ref": order_ref},
+            )
+        except ApiError as error:
+            if error.status_code == 404:
+                return None
+            raise
         self._raise_for_status(response, "position detail")
         return self._object(response, "position detail")
 
@@ -316,13 +332,67 @@ class TraderApiClient:
         ref = payload.get("liqRef") or payload.get("liquidateRef") or payload.get("dealRef")
         return str(ref) if ref is not None and str(ref) else None
 
-    async def _request(self, method: str, url: str, **kwargs: Any) -> httpx.Response:
-        try:
-            response = await self._http.request(method, url, **kwargs)
-        except httpx.HTTPError as error:
-            raise ApiError(f"Trader API request failed: {method} {httpx.URL(url).path}") from error
+    async def _request(
+        self,
+        method: str,
+        url: str,
+        *,
+        retry_unauthorized: bool = True,
+        **kwargs: Any,
+    ) -> httpx.Response:
+        response = await self._send_request(method, url, **kwargs)
+        if response.status_code == 401 and retry_unauthorized:
+            stale_token = self._authorization_token(kwargs.get("headers"))
+            if stale_token:
+                if stale_token == self._access_token:
+                    self._access_token = ""
+                    self._access_token_expires_at = None
+                    token = await self.access_token(force=True)
+                else:
+                    token = await self.access_token()
+                retry_kwargs = dict(kwargs)
+                retry_headers = dict(kwargs.get("headers") or {})
+                retry_headers["Authorization"] = f"Bearer {token}"
+                retry_kwargs["headers"] = retry_headers
+                response = await self._send_request(method, url, **retry_kwargs)
         self._raise_for_status(response, httpx.URL(url).path)
         return response
+
+    async def _send_request(self, method: str, url: str, **kwargs: Any) -> httpx.Response:
+        try:
+            return await self._http.request(method, url, **kwargs)
+        except httpx.HTTPError as error:
+            raise ApiError(f"Trader API request failed: {method} {httpx.URL(url).path}") from error
+
+    @staticmethod
+    def _authorization_token(headers: Any) -> str | None:
+        if headers is None:
+            return None
+        authorization = headers.get("Authorization")
+        if not isinstance(authorization, str) or not authorization.startswith("Bearer "):
+            return None
+        token = authorization.removeprefix("Bearer ").strip()
+        return token or None
+
+    def _access_token_is_fresh(self) -> bool:
+        return bool(self._access_token) and (
+            self._access_token_expires_at is None
+            or time.monotonic() < self._access_token_expires_at
+        )
+
+    @staticmethod
+    def _token_expiry(payload: dict[str, Any]) -> float | None:
+        expires_in = payload.get("expires_in")
+        if isinstance(expires_in, bool) or not isinstance(expires_in, (int, float, str)):
+            return None
+        try:
+            lifetime_minutes = float(expires_in)
+        except (TypeError, ValueError):
+            return None
+        if lifetime_minutes <= 0:
+            return None
+        lifetime_seconds = lifetime_minutes * 60
+        return time.monotonic() + max(0.0, lifetime_seconds - TOKEN_REFRESH_SKEW_SECONDS)
 
     @staticmethod
     def _raise_for_status(response: httpx.Response, context: str) -> None:

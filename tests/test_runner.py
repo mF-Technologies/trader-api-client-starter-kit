@@ -522,7 +522,7 @@ async def test_algo_runner_executes_rest_round_trip_and_clears_journal(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     trading = TradingConfig(
-        contract="EURUSD", amount=1000, max_runtime_seconds=1, poll_seconds=0.001
+        contract="EURUSD", amount=1000, max_runtime_seconds=0.5, poll_seconds=0.001
     )
     config = AppConfig(
         environment="demo",
@@ -537,11 +537,19 @@ async def test_algo_runner_executes_rest_round_trip_and_clears_journal(
         live_trading_enabled=True,
     )
     client = ExecutingTraderClient()
-    signals = iter((Signal.OPEN_BUY, Signal.CLOSE_BUY))
+    signals = iter(
+        (
+            Signal.OPEN_BUY,
+            Signal.CLOSE_BUY,
+            Signal.OPEN_SELL,
+            Signal.CLOSE_SELL,
+        )
+    )
 
     def next_signal(*_args: Any, **_kwargs: Any) -> StrategyEvaluation:
-        signal = next(signals)
-        return StrategyEvaluation(SignalEvent(1, signal, 50, 1, "rsi"), {"rsi": 50})
+        signal = next(signals, None)
+        event = None if signal is None else SignalEvent(1, signal, 50, 1, "rsi")
+        return StrategyEvaluation(event, {"rsi": 50})
 
     monkeypatch.chdir(tmp_path)
     monkeypatch.setattr(
@@ -553,8 +561,9 @@ async def test_algo_runner_executes_rest_round_trip_and_clears_journal(
     result = await algo_runner(config, "live-execute", execute=True)
 
     assert result.outcome.value == "SUCCESS"
-    assert client.add_count == 1
-    assert client.liquidate_count == 1
+    assert client.add_count == 2
+    assert client.liquidate_count == 2
+    assert result.data["instances"]["default"]["status"] == "runtime-limit"
     assert not (tmp_path / "runtime/execution-default-eurusd.json").exists()
     events = [
         json.loads(line)["event"]
@@ -562,18 +571,41 @@ async def test_algo_runner_executes_rest_round_trip_and_clears_journal(
         .read_text(encoding="utf-8")
         .splitlines()
     ]
-    assert events == [
+    lifecycle_events = [
+        event
+        for event in events
+        if event
+        in {
+            "STARTED",
+            "PRICE_SESSION_CONNECTED",
+            "HISTORY_LOADED",
+            "SIGNAL",
+            "ORDER_SUBMITTED",
+            "POSITION_CONFIRMED",
+            "LIQUIDATE_SUBMITTED",
+            "POSITION_CLOSED",
+            "ROUND_TRIP_COMPLETED",
+            "STOPPED",
+        }
+    ]
+    assert lifecycle_events == [
         "STARTED",
         "PRICE_SESSION_CONNECTED",
         "HISTORY_LOADED",
-        "BAR_EVALUATED",
         "SIGNAL",
         "ORDER_SUBMITTED",
         "POSITION_CONFIRMED",
-        "BAR_EVALUATED",
         "SIGNAL",
         "LIQUIDATE_SUBMITTED",
         "POSITION_CLOSED",
+        "ROUND_TRIP_COMPLETED",
+        "SIGNAL",
+        "ORDER_SUBMITTED",
+        "POSITION_CONFIRMED",
+        "SIGNAL",
+        "LIQUIDATE_SUBMITTED",
+        "POSITION_CLOSED",
+        "ROUND_TRIP_COMPLETED",
         "STOPPED",
     ]
     stderr = capsys.readouterr().err
@@ -587,6 +619,8 @@ async def test_algo_runner_executes_rest_round_trip_and_clears_journal(
     assert "indicators=rsi=50" in stderr
     assert "[REST:default] Position confirmed deal_ref=deal-1" in stderr
     assert "[REST:default] Position closed cleanup_ref=liquidate-1" in stderr
+    assert stderr.count("Round trip complete; waiting for the next signal.") == 2
+    assert "[Strategy:default] Stopped status=runtime-limit" in stderr
 
 
 @pytest.mark.asyncio

@@ -39,6 +39,71 @@ async def test_client_exchanges_key_and_reads_account_state() -> None:
 
 
 @pytest.mark.asyncio
+async def test_client_refreshes_access_token_after_expiry() -> None:
+    token_exchange_count = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal token_exchange_count
+        if request.url.path != "/api/tokens/auth":
+            raise AssertionError(f"Unexpected request: {request.method} {request.url}")
+        token_exchange_count += 1
+        return httpx.Response(
+            200,
+            json={"access_token": f"fx-token-{token_exchange_count}", "expires_in": 60},
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+        client = TraderApiClient(
+            web_proxy_url="https://web.example",
+            fxserver_url="https://fx.example",
+            chart_server_url="https://chart.example",
+            api_key="api-key",  # pragma: allowlist secret
+            http_client=http,
+        )
+        assert await client.access_token() == "fx-token-1"
+        client._access_token_expires_at = 0
+        assert await client.access_token() == "fx-token-2"
+
+    assert token_exchange_count == 2
+
+
+@pytest.mark.asyncio
+async def test_client_retries_authenticated_request_after_unauthorized() -> None:
+    token_exchange_count = 0
+    account_requests: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal token_exchange_count
+        if request.url.path == "/api/tokens/auth":
+            token_exchange_count += 1
+            return httpx.Response(
+                200,
+                json={"access_token": f"fx-token-{token_exchange_count}", "expires_in": 60},
+            )
+        if request.url.path == "/accountBalance":
+            authorization = request.headers["Authorization"]
+            account_requests.append(authorization)
+            if authorization == "Bearer fx-token-1":
+                return httpx.Response(401, json={"msg": "Unauthorized"})
+            return httpx.Response(200, json={"balance": 1234.5})
+        raise AssertionError(f"Unexpected request: {request.method} {request.url}")
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+        client = TraderApiClient(
+            web_proxy_url="https://web.example",
+            fxserver_url="https://fx.example",
+            chart_server_url="https://chart.example",
+            api_key="api-key",  # pragma: allowlist secret
+            http_client=http,
+        )
+        balance = await client.get_account_balance()
+
+    assert balance == {"balance": 1234.5}
+    assert account_requests == ["Bearer fx-token-1", "Bearer fx-token-2"]
+    assert token_exchange_count == 2
+
+
+@pytest.mark.asyncio
 async def test_add_market_deal_defers_netting_response_to_reconciliation() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         if request.url.path == "/addDeal":
