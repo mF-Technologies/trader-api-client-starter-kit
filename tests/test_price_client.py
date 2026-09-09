@@ -84,6 +84,18 @@ class BackgroundDisconnectingPriceClient(FakePriceClient):
         asyncio.create_task(fail_send())
 
 
+class JSException(Exception):
+    __module__ = "_quickjs"
+
+
+class BackgroundQuickJsFailingPriceClient(FakePriceClient):
+    def trigger_failure(self) -> None:
+        def fail_callback() -> None:
+            raise JSException("InternalError: out of memory")
+
+        asyncio.get_running_loop().call_soon(fail_callback)
+
+
 class ConnectionEvent:
     type = "ConnectionEvent"
     fx_server_connected = True
@@ -175,6 +187,18 @@ async def test_price_session_converts_unretrieved_disconnect_task_to_transport_f
         await asyncio.sleep(0)
 
         with pytest.raises(PriceTransportError, match="background task disconnected"):
+            await session.get_quote("LLG", timeout_seconds=0.1)
+
+
+@pytest.mark.asyncio
+async def test_price_session_converts_quickjs_callback_failure_to_transport_failure() -> None:
+    client = BackgroundQuickJsFailingPriceClient()
+
+    async with PriceStreamSession(price_config(), client_factory=lambda: client) as session:
+        client.trigger_failure()
+        await asyncio.sleep(0)
+
+        with pytest.raises(PriceTransportError, match="JavaScript runtime failed"):
             await session.get_quote("LLG", timeout_seconds=0.1)
 
 

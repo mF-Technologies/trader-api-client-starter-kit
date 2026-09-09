@@ -1127,8 +1127,12 @@ async def algo_runner(config: AppConfig, mode: str, execute: bool) -> CommandRes
                                     now=loop.time(),
                                 ):
                                     continue
-                                state.status = "round-trip-complete"
-                                state.completed = True
+                                state.status = "waiting-signal"
+                                state.event_log.write("ROUND_TRIP_COMPLETED")
+                                _write_console_status(
+                                    f"Strategy:{instance.name}",
+                                    "Round trip complete; waiting for the next signal.",
+                                )
 
                         heartbeat.write({state.config.name: state.status for state in states})
                         active_polls = [
