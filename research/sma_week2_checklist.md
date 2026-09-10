@@ -84,18 +84,26 @@ restart test.
 
 ## Controlled demo audit status
 
-The authenticated REST account check succeeded in the demo environment. The broker
-reported eight open positions, so the execution-cost round trip was not submitted; the
-audit requires a verified flat account before it can add a test position. The LLG
-contract settings reported a minimum amount of `10` API units, equal to `0.1` lot, for
-the eventual minimum-size round trip.
+The authenticated REST account check and read-only execution-cost snapshot succeeded in
+the demo environment on 2026-09-10. The LLG contract settings reported a minimum amount
+of `10` API units, equal to `0.1` lot, for the eventual minimum-size round trip. One
+quote sample recorded a bid of `4415.38`, an ask of `4416.47`, and a spread of `1.09`
+price units, approximately `2.47 bps`. This is an observation, not a stable spread
+assumption; more samples are required across sessions.
 
-The read-only execution-cost snapshot could not complete because the configured price
-WebSocket returned HTTP 500 during quote collection. No order was submitted. Therefore
-there is still no broker-confirmed exit commission, financing/swap charge, or market
-impact measurement. The replay values remain labelled assumptions until a flat demo
-account, working quote session, and controlled round trip or rollover observation are
-available.
+The contract response also returned `askInterest: -3`, `bidInterest: -2`, and
+`interestMethod: 2`. These are useful broker-provided fields, but their units, rollover
+timing, and cash conversion are not documented by the current response, so they do not
+yet establish the actual swap charge.
+
+The account reported 23 open positions: 19 EUR positions and 4 LLG positions. Because
+unrelated positions are present, the execution-cost round trip was not submitted. The
+close-existing safety mode must not be used until ownership of every position is
+clarified. No order was submitted. There is still no broker-confirmed entry or exit
+commission, cash financing/swap charge, or market-impact measurement. The replay values
+remain labelled assumptions until a flat, intentionally isolated demo account and a
+controlled round trip or rollover observation are available. A previous snapshot attempt
+did return HTTP 500 from the price WebSocket; the later snapshot recovered successfully.
 
 ## Live-observe evidence
 
