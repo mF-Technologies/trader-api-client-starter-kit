@@ -70,6 +70,19 @@ class ListeningPriceClient(FakePriceClient):
         self.removed_listener = callback_id
 
 
+class ControllableListeningPriceClient(FakePriceClient):
+    def __init__(self) -> None:
+        super().__init__()
+        self.price_callback: Any = None
+
+    def add_price_listener(self, callback: Any) -> str:
+        self.price_callback = callback
+        return "listener-1"
+
+    def emit(self, *contracts: str) -> None:
+        self.price_callback(PriceEvent(list(contracts)))
+
+
 class ListenerFailingPriceClient(FakePriceClient):
     def add_price_listener(self, callback: Any) -> str:
         raise RuntimeError("listener failed")
@@ -155,6 +168,40 @@ async def test_price_session_uses_price_update_listener() -> None:
 
     assert quote.bid == 4000
     assert client.removed_listener == ""
+
+
+@pytest.mark.asyncio
+async def test_price_session_accepts_quiet_contract_when_shared_stream_is_active(
+) -> None:
+    client = ControllableListeningPriceClient()
+    now = 100.0
+
+    async with PriceStreamSession(
+        price_config(), client_factory=lambda: client, clock=lambda: now
+    ) as session:
+        client.emit("EURUSD")
+        now = 120.0
+        client.emit("LLG")
+
+        quote = await session.get_quote("EURUSD", timeout_seconds=0.01)
+
+    assert quote.bid == 1.1
+
+
+@pytest.mark.asyncio
+async def test_price_session_restarts_when_shared_stream_stops_updating(
+) -> None:
+    client = ControllableListeningPriceClient()
+    now = 100.0
+
+    async with PriceStreamSession(
+        price_config(), client_factory=lambda: client, clock=lambda: now
+    ) as session:
+        client.emit("LLG")
+        now = 221.0
+
+        with pytest.raises(PriceTransportError, match="stopped updating"):
+            await session.get_quote("LLG", timeout_seconds=0.01)
 
 
 @pytest.mark.asyncio
