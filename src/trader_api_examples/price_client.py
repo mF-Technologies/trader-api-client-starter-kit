@@ -17,6 +17,9 @@ class QuoteUnavailableError(TimeoutError):
     """Raised when one contract has no fresh quote on a healthy transport."""
 
 
+PRICE_STREAM_STALE_SECONDS = 120.0
+
+
 @dataclass(frozen=True)
 class Quote:
     contract: str
@@ -42,13 +45,16 @@ class PriceStreamSession:
         config: AppConfig,
         *,
         client_factory: Callable[[], PriceClient] | None = None,
+        clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self.config = config
         self._client_factory = client_factory
+        self._clock = clock
         self._client: PriceClient | None = None
         self._price_listener_id: str | None = None
         self._event_listener_id: str | None = None
         self._last_updates: dict[str, float] = {}
+        self._last_stream_update: float | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
         self._previous_exception_handler: (
             Callable[[asyncio.AbstractEventLoop, dict[str, Any]], object] | None
@@ -112,6 +118,7 @@ class PriceStreamSession:
             raise
         self._client = client
         self._last_updates.clear()
+        self._last_stream_update = None
         add_listener = getattr(client, "add_price_listener", None)
         try:
             if add_listener is not None:
@@ -135,11 +142,13 @@ class PriceStreamSession:
         self._price_listener_id = None
         self._event_listener_id = None
         self._last_updates.clear()
+        self._last_stream_update = None
         await asyncio.sleep(0)
         self._restore_loop_exception_handler()
 
     def _record_price_update(self, event: Any) -> None:
-        received_at = time.monotonic()
+        received_at = self._clock()
+        self._last_stream_update = received_at
         for contract in getattr(event, "contract_codes", ()):
             self._last_updates[str(contract).strip().upper()] = received_at
 
@@ -203,12 +212,16 @@ class PriceStreamSession:
             except Exception as error:
                 raise PriceTransportError(f"Price transport failed for {contract}.") from error
             last_update = self._last_updates.get(contract.strip().upper())
-            listener_is_fresh = (
-                self._price_listener_id is None
-                or last_update is not None
-                and time.monotonic() - last_update <= timeout_seconds
-            )
-            if price is not None and listener_is_fresh:
+            if (
+                self._price_listener_id is not None
+                and self._last_stream_update is not None
+                and self._clock() - self._last_stream_update > PRICE_STREAM_STALE_SECONDS
+            ):
+                raise PriceTransportError(
+                    "Shared price stream stopped updating; restart the process."
+                )
+            listener_has_seen_contract = self._price_listener_id is None or last_update is not None
+            if price is not None and listener_has_seen_contract:
                 return Quote(
                     contract=contract,
                     bid=float(price.bid),
