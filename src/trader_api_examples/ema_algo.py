@@ -12,30 +12,28 @@ from .api import Bar
 from .strategy import PositionSide, Signal
 
 
-## These classes are used to store information. Names are mostly self-explanatory.
-## Stores SMA20 and SMA50 and ATR14 arrays
 @dataclass(frozen=True)
-class SmaIndicators:
+class EmaIndicators:
     fast: np.ndarray
     slow: np.ndarray
     atr: np.ndarray
 
 
 @dataclass(frozen=True)
-class SmaSignalEvent:
+class EmaSignalEvent:
     signal_time_ms: int
     execution_time_ms: int | None
     signal: Signal
     reason: str
-    sma_fast: float
-    sma_slow: float
+    ema_fast: float
+    ema_slow: float
     atr: float
     close: float
     stop_price: float | None = None
 
 
 @dataclass(frozen=True)
-class SmaTrade:
+class EmaTrade:
     entry_time_ms: int
     exit_time_ms: int
     entry_price: float
@@ -47,12 +45,12 @@ class SmaTrade:
     net_pnl: float
     exit_reason: str
 
-## REplay results.
+
 @dataclass(frozen=True)
-class SmaBacktestResult:
+class EmaBacktestResult:
     outcome: Outcome
-    events: list[SmaSignalEvent]
-    trades: list[SmaTrade]
+    events: list[EmaSignalEvent]
+    trades: list[EmaTrade]
     final_equity: float
     buy_and_hold_equity: float
     strategy_return: float
@@ -65,7 +63,7 @@ class SmaBacktestResult:
     blocked_entry_count: int
     message: str
 
-## Internal state for the currently open simulated trade.
+
 @dataclass
 class _OpenPosition:
     entry_time_ms: int
@@ -73,9 +71,9 @@ class _OpenPosition:
     amount: float
     stop_price: float
     stop_reason: str
-    entry_event: SmaSignalEvent
+    entry_event: EmaSignalEvent
 
-## how many candles are needed before the strategy can work.
+
 def required_bar_count(*, slow_period: int, atr_period: int) -> int:
     _validate_parameters(
         fast_period=1,
@@ -89,10 +87,10 @@ def required_bar_count(*, slow_period: int, atr_period: int) -> int:
     )
     return max(slow_period + 1, atr_period + 2)
 
-## Extracts candles to calculate SMA & ATR values.
-def calculate_sma_indicators(
+
+def calculate_ema_indicators(
     bars: list[Bar], *, fast_period: int, slow_period: int, atr_period: int
-) -> SmaIndicators:
+) -> EmaIndicators:
     _validate_parameters(
         fast_period=fast_period,
         slow_period=slow_period,
@@ -106,14 +104,14 @@ def calculate_sma_indicators(
     closes = np.asarray([bar.close for bar in bars], dtype=np.float64)
     highs = np.asarray([bar.high for bar in bars], dtype=np.float64)
     lows = np.asarray([bar.low for bar in bars], dtype=np.float64)
-    return SmaIndicators(
-        fast=talib.SMA(closes, timeperiod=fast_period),
-        slow=talib.SMA(closes, timeperiod=slow_period),
+    return EmaIndicators(
+        fast=talib.EMA(closes, timeperiod=fast_period),
+        slow=talib.EMA(closes, timeperiod=slow_period),
         atr=talib.ATR(highs, lows, closes, timeperiod=atr_period),
     )
 
-## The crossover entry & exit rules. ie SMA50 - (ATR buffer x ATR14)
-def latest_sma_signal(
+
+def latest_ema_signal(
     bars: list[Bar],
     *,
     fast_period: int = 20,
@@ -121,7 +119,7 @@ def latest_sma_signal(
     atr_period: int = 14,
     atr_buffer: float = 0.0,
     position_side: PositionSide | None,
-) -> SmaSignalEvent | None:
+) -> EmaSignalEvent | None:
     _validate_parameters(
         fast_period=fast_period,
         slow_period=slow_period,
@@ -135,7 +133,7 @@ def latest_sma_signal(
     if len(bars) < required_bar_count(slow_period=slow_period, atr_period=atr_period):
         return None
     _validate_bars(bars)
-    indicators = calculate_sma_indicators(
+    indicators = calculate_ema_indicators(
         bars, fast_period=fast_period, slow_period=slow_period, atr_period=atr_period
     )
     return _signal_at(
@@ -146,16 +144,8 @@ def latest_sma_signal(
         atr_buffer=atr_buffer,
     )
 
-## code for backtesting, takes all the historical data, sma periods etc.
-## Read completed candle
-## Check whether an earlier exit is pending
-## Check whether an earlier entry is pending
-## Apply protective stop
-## Detect a new crossover at the candle close
-## Schedule action for the next candle
-## Update equity
-## Apply daily-loss and drawdown limits
-def evaluate_sma_replay(
+
+def evaluate_ema_replay(
     bars: list[Bar],
     *,
     fast_period: int = 20,
@@ -179,7 +169,7 @@ def evaluate_sma_replay(
     annualization_factor: float = 252.0,
     evaluation_start_index: int = 0,
     evaluation_end_index: int | None = None,
-) -> SmaBacktestResult:
+) -> EmaBacktestResult:
     _validate_parameters(
         fast_period=fast_period,
         slow_period=slow_period,
@@ -203,7 +193,7 @@ def evaluate_sma_replay(
     if not isfinite(annualization_factor) or annualization_factor <= 0:
         raise ValueError("annualization_factor must be finite and greater than zero.")
     if len(bars) < required_bar_count(slow_period=slow_period, atr_period=atr_period):
-        return _empty_result(Outcome.INCONCLUSIVE, "Not enough completed bars for SMA/ATR.")
+        return _empty_result(Outcome.INCONCLUSIVE, "Not enough completed bars for EMA/ATR.")
     _validate_bars(bars)
     evaluation_end = len(bars) if evaluation_end_index is None else evaluation_end_index
     _validate_evaluation_bounds(
@@ -213,16 +203,16 @@ def evaluate_sma_replay(
         required_count=required_bar_count(slow_period=slow_period, atr_period=atr_period),
     )
 
-    indicators = calculate_sma_indicators(
+    indicators = calculate_ema_indicators(
         bars, fast_period=fast_period, slow_period=slow_period, atr_period=atr_period
     )
     initial_equity = amount * bars[evaluation_start_index].open
-    events: list[SmaSignalEvent] = []
-    trades: list[SmaTrade] = []
+    events: list[EmaSignalEvent] = []
+    trades: list[EmaTrade] = []
     equity_curve = [initial_equity]
     realized_pnl = 0.0
     position: _OpenPosition | None = None
-    pending_entry: tuple[int, SmaSignalEvent] | None = None
+    pending_entry: tuple[int, EmaSignalEvent] | None = None
     pending_exit: str | None = None
     current_day: date | None = None
     daily_start_equity = initial_equity
@@ -302,8 +292,7 @@ def evaluate_sma_replay(
 
         if position is not None and bar.low <= position.stop_price:
             raw_exit_price = bar.open if bar.open <= position.stop_price else position.stop_price
-            stop_event = _stop_event(bar, index, indicators, position)
-            events.append(stop_event)
+            events.append(_stop_event(bar, index, indicators, position))
             trade = _close_position(
                 position,
                 exit_time_ms=bar.time_ms,
@@ -422,11 +411,11 @@ def evaluate_sma_replay(
     opened = any(event.signal is Signal.OPEN_BUY for event in events)
     outcome = Outcome.SUCCESS if opened else Outcome.NO_SIGNAL
     message = (
-        "SMA replay completed with transaction costs and next-bar execution."
+        "EMA replay completed with transaction costs and next-bar execution."
         if opened
-        else "No valid SMA bullish crossover occurred."
+        else "No valid EMA bullish crossover occurred."
     )
-    return SmaBacktestResult(
+    return EmaBacktestResult(
         outcome=outcome,
         events=events,
         trades=trades,
@@ -444,7 +433,7 @@ def evaluate_sma_replay(
     )
 
 
-def synthetic_sma_fixture() -> list[Bar]:
+def synthetic_ema_fixture() -> list[Bar]:
     closes = (
         [100.0 - index * 0.2 for index in range(70)]
         + [86.0 + index * 0.55 for index in range(90)]
@@ -464,12 +453,12 @@ def synthetic_sma_fixture() -> list[Bar]:
 
 def _signal_at(
     bars: list[Bar],
-    indicators: SmaIndicators,
+    indicators: EmaIndicators,
     *,
     index: int,
     position_side: PositionSide | None,
     atr_buffer: float,
-) -> SmaSignalEvent | None:
+) -> EmaSignalEvent | None:
     if index < 1:
         return None
     values = (
@@ -484,13 +473,13 @@ def _signal_at(
         return None
     previous_fast, previous_slow, previous_atr, current_fast, current_slow, current_atr = values
     if position_side is None and previous_fast <= previous_slow and current_fast > current_slow:
-        return SmaSignalEvent(
+        return EmaSignalEvent(
             signal_time_ms=bars[index].time_ms,
             execution_time_ms=None,
             signal=Signal.OPEN_BUY,
-            reason="BULLISH_SMA_CROSSOVER",
-            sma_fast=current_fast,
-            sma_slow=current_slow,
+            reason="BULLISH_EMA_CROSSOVER",
+            ema_fast=current_fast,
+            ema_slow=current_slow,
             atr=current_atr,
             close=bars[index].close,
         )
@@ -499,13 +488,13 @@ def _signal_at(
     previous_exit_level = previous_slow - atr_buffer * previous_atr
     current_exit_level = current_slow - atr_buffer * current_atr
     if previous_fast >= previous_exit_level and current_fast < current_exit_level:
-        return SmaSignalEvent(
+        return EmaSignalEvent(
             signal_time_ms=bars[index].time_ms,
             execution_time_ms=None,
             signal=Signal.CLOSE_BUY,
-            reason="BEARISH_SMA_CROSSOVER_WITH_ATR_BUFFER",
-            sma_fast=current_fast,
-            sma_slow=current_slow,
+            reason="BEARISH_EMA_CROSSOVER_WITH_ATR_BUFFER",
+            ema_fast=current_fast,
+            ema_slow=current_slow,
             atr=current_atr,
             close=bars[index].close,
         )
@@ -513,23 +502,23 @@ def _signal_at(
 
 
 def _stop_event(
-    bar: Bar, index: int, indicators: SmaIndicators, position: _OpenPosition
-) -> SmaSignalEvent:
+    bar: Bar, index: int, indicators: EmaIndicators, position: _OpenPosition
+) -> EmaSignalEvent:
     values = (
         float(indicators.fast[index]),
         float(indicators.slow[index]),
         float(indicators.atr[index]),
     )
-    fast = values[0] if isfinite(values[0]) else position.entry_event.sma_fast
-    slow = values[1] if isfinite(values[1]) else position.entry_event.sma_slow
+    fast = values[0] if isfinite(values[0]) else position.entry_event.ema_fast
+    slow = values[1] if isfinite(values[1]) else position.entry_event.ema_slow
     atr = values[2] if isfinite(values[2]) else position.entry_event.atr
-    return SmaSignalEvent(
+    return EmaSignalEvent(
         signal_time_ms=bar.time_ms,
         execution_time_ms=bar.time_ms,
         signal=Signal.CLOSE_BUY,
         reason=position.stop_reason,
-        sma_fast=fast,
-        sma_slow=slow,
+        ema_fast=fast,
+        ema_slow=slow,
         atr=atr,
         close=bar.close,
         stop_price=position.stop_price,
@@ -539,25 +528,25 @@ def _stop_event(
 def _risk_exit_event(
     bars: list[Bar],
     index: int,
-    indicators: SmaIndicators,
+    indicators: EmaIndicators,
     position: _OpenPosition,
     reason: str,
-) -> SmaSignalEvent:
+) -> EmaSignalEvent:
     values = (
         float(indicators.fast[index]),
         float(indicators.slow[index]),
         float(indicators.atr[index]),
     )
-    fast = values[0] if isfinite(values[0]) else position.entry_event.sma_fast
-    slow = values[1] if isfinite(values[1]) else position.entry_event.sma_slow
+    fast = values[0] if isfinite(values[0]) else position.entry_event.ema_fast
+    slow = values[1] if isfinite(values[1]) else position.entry_event.ema_slow
     atr = values[2] if isfinite(values[2]) else position.entry_event.atr
-    return SmaSignalEvent(
+    return EmaSignalEvent(
         signal_time_ms=bars[index].time_ms,
         execution_time_ms=bars[index + 1].time_ms,
         signal=Signal.CLOSE_BUY,
         reason=reason,
-        sma_fast=fast,
-        sma_slow=slow,
+        ema_fast=fast,
+        ema_slow=slow,
         atr=atr,
         close=bars[index].close,
         stop_price=position.stop_price,
@@ -565,8 +554,8 @@ def _risk_exit_event(
 
 
 def _holding_time_event(
-    bars: list[Bar], index: int, indicators: SmaIndicators, position: _OpenPosition
-) -> SmaSignalEvent:
+    bars: list[Bar], index: int, indicators: EmaIndicators, position: _OpenPosition
+) -> EmaSignalEvent:
     return _risk_exit_event(bars, index, indicators, position, "MAX_HOLDING_TIME")
 
 
@@ -581,7 +570,7 @@ def _mark_equity(
         equity += (mark_price - position.entry_price) * position.amount
     return equity
 
-## calcs complete trade
+
 def _close_position(
     position: _OpenPosition,
     *,
@@ -596,7 +585,7 @@ def _close_position(
     spread_bps: float,
     financing_bps_per_day: float,
     market_impact_bps: float,
-) -> SmaTrade:
+) -> EmaTrade:
     exit_price = _sell_fill(
         raw_exit_price,
         slippage_bps,
@@ -616,7 +605,7 @@ def _close_position(
         amount=position.amount,
         financing_bps_per_day=financing_bps_per_day,
     )
-    return SmaTrade(
+    return EmaTrade(
         entry_time_ms=position.entry_time_ms,
         exit_time_ms=exit_time_ms,
         entry_price=position.entry_price,
@@ -732,7 +721,7 @@ def _sell_fill(
         - (slippage_bps + market_impact_bps) / 10_000.0
     )
 
-## holding cost estimte
+
 def _financing_cost(
     *,
     entry_time_ms: int,
@@ -777,16 +766,16 @@ def _validate_evaluation_bounds(
     if evaluation_start_index >= evaluation_end_index - 1:
         raise ValueError("Evaluation must contain at least two bars after the start index.")
     if evaluation_start_index == 0 and evaluation_end_index < required_count:
-        raise ValueError("evaluation_end_index must include enough bars for SMA/ATR warm-up.")
+        raise ValueError("evaluation_end_index must include enough bars for EMA/ATR warm-up.")
     if evaluation_start_index > 0 and evaluation_start_index < required_count - 1:
         raise ValueError(
             f"evaluation_start_index must have at least {required_count - 1} prior bars "
-            "for SMA/ATR warm-up."
+            "for EMA/ATR warm-up."
         )
 
 
-def _empty_result(outcome: Outcome, message: str) -> SmaBacktestResult:
-    return SmaBacktestResult(
+def _empty_result(outcome: Outcome, message: str) -> EmaBacktestResult:
+    return EmaBacktestResult(
         outcome=outcome,
         events=[],
         trades=[],
@@ -826,7 +815,7 @@ def _validate_parameters(
     max_drawdown_pct: float | None = None,
 ) -> None:
     if fast_period <= 0 or slow_period <= 0 or atr_period <= 0:
-        raise ValueError("SMA and ATR periods must be greater than zero.")
+        raise ValueError("EMA and ATR periods must be greater than zero.")
     if fast_period >= slow_period:
         raise ValueError("fast_period must be below slow_period.")
     if not isfinite(atr_buffer) or atr_buffer < 0:
@@ -852,13 +841,8 @@ def _validate_parameters(
         raise ValueError("slippage_bps must be finite and between zero and 10000.")
     if not isfinite(commission_per_unit) or commission_per_unit < 0:
         raise ValueError("commission_per_unit must be finite and not negative.")
-    if (
-        not isfinite(commission_round_turn_per_lot)
-        or commission_round_turn_per_lot < 0
-    ):
-        raise ValueError(
-            "commission_round_turn_per_lot must be finite and not negative."
-        )
+    if not isfinite(commission_round_turn_per_lot) or commission_round_turn_per_lot < 0:
+        raise ValueError("commission_round_turn_per_lot must be finite and not negative.")
     if not isfinite(amount_per_lot) or amount_per_lot <= 0:
         raise ValueError("amount_per_lot must be finite and greater than zero.")
     for name, value in (

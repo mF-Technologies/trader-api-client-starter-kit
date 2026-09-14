@@ -2,17 +2,33 @@ from pathlib import Path
 
 import pytest
 
-from trader_api_examples.config import ConfigError, TradingConfig, load_config
+from trader_api_examples.config import (
+    AppConfig,
+    ConfigError,
+    StrategyConfig,
+    TradingConfig,
+    load_config,
+)
 
 
 def test_default_research_contract_is_llg() -> None:
     assert TradingConfig().contract == "LLG"
+    assert TradingConfig().max_total_open_positions == 1
     assert TradingConfig().amount_per_lot == 1.0
     assert TradingConfig().max_runtime_seconds == 600
     assert TradingConfig().max_holding_hours == 120.0
     assert TradingConfig().max_trade_loss_pct == 1.0
     assert TradingConfig().max_daily_loss_pct == 2.0
     assert TradingConfig().max_drawdown_pct == 10.0
+
+
+def test_ema_defaults_follow_sma_timeframe_and_periods() -> None:
+    config = AppConfig(environment="demo", strategy=StrategyConfig())
+
+    assert config.strategy.ema_period_type is None
+    assert config.strategy.ema_fast_period == 20
+    assert config.strategy.ema_slow_period == 50
+    assert config.strategy.ema_exit_buffer_atr == 0.0
 
 
 def test_load_config_rejects_nonpositive_holding_time(
@@ -26,6 +42,20 @@ def test_load_config_rejects_nonpositive_holding_time(
     monkeypatch.setenv("TRADER_API_KEY", "api-key")  # pragma: allowlist secret
 
     with pytest.raises(ConfigError, match="max_holding_hours"):
+        load_config(config_path)
+
+
+def test_load_config_rejects_invalid_total_position_limit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        "environment: demo\ntrading:\n  max_total_open_positions: 0\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("TRADER_API_KEY", "api-key")  # pragma: allowlist secret
+
+    with pytest.raises(ConfigError, match="max_total_open_positions"):
         load_config(config_path)
 
 
@@ -227,4 +257,19 @@ def test_load_config_rejects_unsupported_sma_period(
     monkeypatch.setenv("TRADER_API_KEY", "api-key")  # pragma: allowlist secret
 
     with pytest.raises(ConfigError, match="sma_period_type"):
+        load_config(config_path)
+
+
+def test_load_config_rejects_unsupported_ema_period(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        "environment: demo\nstrategy:\n  ema_period_type: 4\n",
+        encoding="utf-8",
+    )
+
+    monkeypatch.setenv("TRADER_API_KEY", "api-key")  # pragma: allowlist secret
+
+    with pytest.raises(ConfigError, match="ema_period_type"):
         load_config(config_path)

@@ -13,8 +13,11 @@ from trader_api_examples.config import (
     StrategyConfig,
     TradingConfig,
 )
+from trader_api_examples.ema_algo import EmaSignalEvent
 from trader_api_examples.price_client import Quote
-from trader_api_examples.safety import Journal, JournalState, LiveRiskState
+from trader_api_examples.safety import Journal, JournalState, LiveExecutionBlocked, LiveRiskState
+from trader_api_examples.sma_algo import SmaSignalEvent
+from trader_api_examples.strategy import Signal
 
 
 def bar_at(timestamp: datetime, price: float = 100.0) -> Bar:
@@ -135,7 +138,7 @@ class FakeMarketDataClient:
         return {"equity": 1000.0, "currency": "USD"}
 
 
-def live_sma_config() -> AppConfig:
+def live_sma_config(*, max_total_open_positions: int = 1) -> AppConfig:
     return AppConfig(
         environment="demo",
         endpoints=EndpointsConfig(
@@ -146,6 +149,7 @@ def live_sma_config() -> AppConfig:
         trading=TradingConfig(
             contract="LLG",
             amount=10,
+            max_total_open_positions=max_total_open_positions,
             max_runtime_seconds=1,
             max_holding_hours=1,
             poll_seconds=0,
@@ -155,6 +159,42 @@ def live_sma_config() -> AppConfig:
         secrets=Secrets(api_key="test-api-key"),
         live_trading_enabled=True,
     )
+
+
+@pytest.mark.asyncio
+async def test_live_ema_rejects_order_execution_before_connecting() -> None:
+    with pytest.raises(LiveExecutionBlocked, match="EMA live execution is intentionally disabled"):
+        await commands.live_ema_algo(live_sma_config(), "live-execute", execute=True)
+
+
+@pytest.mark.asyncio
+async def test_live_ema_observe_reports_signal_without_order_mutation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    now = datetime(2026, 1, 5, 10, 30, tzinfo=UTC)
+    fake_client = FakeMarketDataClient([bar_at(now - timedelta(minutes=30))])
+    monkeypatch.setattr(commands.time, "time", lambda: now.timestamp())
+    monkeypatch.setattr(commands, "make_client", lambda *_args, **_kwargs: fake_client)
+
+    def bullish_signal(*_args: object, **_kwargs: object) -> EmaSignalEvent:
+        return EmaSignalEvent(
+            signal_time_ms=fake_client.bars[-1].time_ms,
+            execution_time_ms=None,
+            signal=Signal.OPEN_BUY,
+            reason="BULLISH_EMA_CROSSOVER",
+            ema_fast=101.0,
+            ema_slow=100.0,
+            atr=1.0,
+            close=100.0,
+        )
+
+    monkeypatch.setattr(commands, "latest_ema_signal", bullish_signal)
+
+    result = await commands.live_ema_algo(live_sma_config(), "live-observe", execute=False)
+
+    assert result.outcome is Outcome.SUCCESS
+    assert result.data["period_type"] == 2
+    assert result.data["proposed_event"]["reason"] == "BULLISH_EMA_CROSSOVER"
 
 
 @pytest.mark.asyncio
@@ -201,7 +241,7 @@ async def test_live_sma_runtime_limit_applies_while_flat(
 
 @pytest.mark.asyncio
 async def test_live_sma_blocks_unrelated_open_position(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     class OccupiedClient(FakeMarketDataClient):
         async def get_positions(self) -> list[dict[str, object]]:
@@ -209,12 +249,97 @@ async def test_live_sma_blocks_unrelated_open_position(
 
     fake_client = OccupiedClient([])
     monkeypatch.setattr(commands, "make_client", lambda *_args, **_kwargs: fake_client)
+    monkeypatch.setattr(commands, "_journal_path", lambda _config: tmp_path / "execution.json")
 
     result = await commands.live_sma_algo(live_sma_config(), "live-execute", execute=True)
 
     assert result.outcome is Outcome.BLOCKED
     assert result.data["unrelated_position_count"] == 1
-    assert result.data["max_open_positions"] == 1
+    assert result.data["open_position_count"] == 1
+    assert result.data["max_managed_positions"] == 1
+    assert result.data["max_total_open_positions"] == 1
+
+
+@pytest.mark.asyncio
+async def test_live_sma_allows_seven_unrelated_positions_with_eighth_position_capacity(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    class OccupiedClient(FakeMarketDataClient):
+        async def get_positions(self) -> list[dict[str, object]]:
+            return [
+                {"ref": f"manual-deal-{index}", "contract": "LLG", "amount": 10}
+                for index in range(7)
+            ]
+
+    now = datetime(2026, 1, 5, 10, 30, tzinfo=UTC)
+    fake_client = OccupiedClient([bar_at(now - timedelta(minutes=30))])
+    monkeypatch.setattr(commands.time, "time", lambda: now.timestamp())
+    monkeypatch.setattr(commands, "make_client", lambda *_args, **_kwargs: fake_client)
+
+    def bullish_signal(*_args: object, **_kwargs: object) -> SmaSignalEvent:
+        return SmaSignalEvent(
+            signal_time_ms=fake_client.bars[-1].time_ms,
+            execution_time_ms=None,
+            signal=Signal.OPEN_BUY,
+            reason="BULLISH_SMA_CROSSOVER",
+            sma_fast=101.0,
+            sma_slow=100.0,
+            atr=1.0,
+            close=100.0,
+        )
+
+    monkeypatch.setattr(commands, "latest_sma_signal", bullish_signal)
+
+    async def read_safe_quote(*_args: object, **_kwargs: object) -> Quote:
+        return Quote(contract="LLG", bid=100.0, ask=100.1, tag="test")
+
+    monkeypatch.setattr(
+        commands, "read_quote", read_safe_quote
+    )
+
+    class StopAfterOpen(Exception):
+        pass
+
+    class FakeExecutionManager:
+        def __init__(self, *_args: object, **_kwargs: object) -> None:
+            pass
+
+        async def open_position(self, **_kwargs: object) -> None:
+            raise StopAfterOpen
+
+    monkeypatch.setattr(commands, "ExecutionManager", FakeExecutionManager)
+    monkeypatch.setattr(commands, "_risk_state_path", lambda _config: tmp_path / "risk.json")
+    monkeypatch.setattr(commands, "_journal_path", lambda _config: tmp_path / "execution.json")
+
+    with pytest.raises(StopAfterOpen):
+        await commands.live_sma_algo(
+            live_sma_config(max_total_open_positions=8), "live-execute", execute=True
+        )
+
+
+@pytest.mark.asyncio
+async def test_live_sma_blocks_when_total_position_capacity_is_full(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    class OccupiedClient(FakeMarketDataClient):
+        async def get_positions(self) -> list[dict[str, object]]:
+            return [
+                {"ref": f"manual-deal-{index}", "contract": "LLG", "amount": 10}
+                for index in range(8)
+            ]
+
+    fake_client = OccupiedClient([])
+    monkeypatch.setattr(commands, "make_client", lambda *_args, **_kwargs: fake_client)
+    monkeypatch.setattr(commands, "_journal_path", lambda _config: tmp_path / "execution.json")
+
+    result = await commands.live_sma_algo(
+        live_sma_config(max_total_open_positions=8), "live-execute", execute=True
+    )
+
+    assert result.outcome is Outcome.BLOCKED
+    assert result.data["open_position_count"] == 8
+    assert result.data["max_managed_positions"] == 1
+    assert result.data["max_total_open_positions"] == 8
 
 
 @pytest.mark.asyncio

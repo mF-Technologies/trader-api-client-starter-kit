@@ -39,6 +39,8 @@ class EndpointsConfig:
 class TradingConfig:
     contract: str = "LLG"
     amount: float = 1000.0
+    # Account-wide ceiling; the SMA execution path still manages at most one owned position.
+    max_total_open_positions: int = 1
     # API amount represented by one lot when converting lot-based replay costs.
     amount_per_lot: float = 1.0
     # Applies while flat and waiting for a new entry. An open trade uses max_holding_hours.
@@ -67,8 +69,13 @@ class StrategyConfig:
     sma_period_type: int = 3
     sma_fast_period: int = 20
     sma_slow_period: int = 50
+    # EMA follows the SMA timeframe unless explicitly set for a separate experiment.
+    ema_period_type: int | None = None
+    ema_fast_period: int = 20
+    ema_slow_period: int = 50
     atr_period: int = 14
     sma_exit_buffer_atr: float = 0.0
+    ema_exit_buffer_atr: float = 0.0
     atr_stop_multiple: float = 2.0
     commission_rate: float = 0.0
     slippage_bps: float = 0.0
@@ -174,6 +181,12 @@ def load_config(path: Path, *, require_api_key: bool = True) -> AppConfig:
 def _validate_config(config: AppConfig) -> None:
     if config.trading.amount <= 0:
         raise ConfigError("trading.amount must be greater than zero.")
+    if (
+        isinstance(config.trading.max_total_open_positions, bool)
+        or not isinstance(config.trading.max_total_open_positions, int)
+        or config.trading.max_total_open_positions <= 0
+    ):
+        raise ConfigError("trading.max_total_open_positions must be a positive integer.")
     if not isfinite(config.trading.amount_per_lot) or config.trading.amount_per_lot <= 0:
         raise ConfigError("trading.amount_per_lot must be finite and greater than zero.")
     if config.trading.max_runtime_seconds <= 0:
@@ -224,10 +237,24 @@ def _validate_config(config: AppConfig) -> None:
         raise ConfigError("strategy.sma_fast_period must be greater than zero.")
     if config.strategy.sma_fast_period >= config.strategy.sma_slow_period:
         raise ConfigError("strategy.sma_fast_period must be below sma_slow_period.")
+    if config.strategy.ema_period_type is not None and config.strategy.ema_period_type not in {
+        1,
+        2,
+        3,
+    }:
+        raise ConfigError(
+            "strategy.ema_period_type must be 1 (minute), 2 (hourly), or 3 (daily)."
+        )
+    if config.strategy.ema_fast_period <= 0:
+        raise ConfigError("strategy.ema_fast_period must be greater than zero.")
+    if config.strategy.ema_fast_period >= config.strategy.ema_slow_period:
+        raise ConfigError("strategy.ema_fast_period must be below ema_slow_period.")
     if config.strategy.atr_period <= 0:
         raise ConfigError("strategy.atr_period must be greater than zero.")
     if config.strategy.sma_exit_buffer_atr < 0:
         raise ConfigError("strategy.sma_exit_buffer_atr must not be negative.")
+    if config.strategy.ema_exit_buffer_atr < 0:
+        raise ConfigError("strategy.ema_exit_buffer_atr must not be negative.")
     if config.strategy.atr_stop_multiple <= 0:
         raise ConfigError("strategy.atr_stop_multiple must be greater than zero.")
     if config.strategy.commission_rate < 0:

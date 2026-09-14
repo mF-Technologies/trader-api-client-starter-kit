@@ -19,6 +19,14 @@ from .algo import AlgoResult, Outcome, evaluate_replay, latest_signal
 from .api import PERIOD_DURATION, Bar, TraderApiClient
 from .config import AppConfig
 from .contracts import calculate_amount, find_contract_setting, validate_amount
+from .ema_algo import (
+    EmaBacktestResult,
+    EmaSignalEvent,
+    EmaTrade,
+    evaluate_ema_replay,
+    latest_ema_signal,
+    synthetic_ema_fixture,
+)
 from .execution import ExecutionManager
 from .output import CommandResult
 from .price_client import Quote, read_quote
@@ -274,6 +282,66 @@ def _sma_result_data(result: SmaBacktestResult) -> dict[str, Any]:
     }
 
 
+def _ema_event_data(events: list[EmaSignalEvent]) -> list[dict[str, Any]]:
+    return [
+        {
+            "signal_time_ms": event.signal_time_ms,
+            "execution_time_ms": event.execution_time_ms,
+            "signal": event.signal.value,
+            "reason": event.reason,
+            "ema_fast": round(event.ema_fast, 8),
+            "ema_slow": round(event.ema_slow, 8),
+            "atr": round(event.atr, 8),
+            "close": event.close,
+            "stop_price": (round(event.stop_price, 8) if event.stop_price is not None else None),
+        }
+        for event in events
+    ]
+
+
+def _ema_trade_data(trades: list[EmaTrade]) -> list[dict[str, Any]]:
+    return [
+        {
+            "entry_time_ms": trade.entry_time_ms,
+            "exit_time_ms": trade.exit_time_ms,
+            "entry_price": round(trade.entry_price, 8),
+            "exit_price": round(trade.exit_price, 8),
+            "amount": trade.amount,
+            "gross_pnl": round(trade.gross_pnl, 8),
+            "commission": round(trade.commission, 8),
+            "financing": round(trade.financing, 8),
+            "net_pnl": round(trade.net_pnl, 8),
+            "exit_reason": trade.exit_reason,
+        }
+        for trade in trades
+    ]
+
+
+def _ema_result_data(result: EmaBacktestResult) -> dict[str, Any]:
+    return {
+        "events": _ema_event_data(result.events),
+        "trades": _ema_trade_data(result.trades),
+        "metrics": {
+            "final_equity": round(result.final_equity, 8),
+            "buy_and_hold_equity": round(result.buy_and_hold_equity, 8),
+            "strategy_return": round(result.strategy_return, 8),
+            "buy_and_hold_return": round(result.buy_and_hold_return, 8),
+            "strategy_sharpe": (
+                round(result.strategy_sharpe, 8) if result.strategy_sharpe is not None else None
+            ),
+            "buy_and_hold_sharpe": (
+                round(result.buy_and_hold_sharpe, 8)
+                if result.buy_and_hold_sharpe is not None
+                else None
+            ),
+            "strategy_max_drawdown": round(result.strategy_max_drawdown, 8),
+            "buy_and_hold_max_drawdown": round(result.buy_and_hold_max_drawdown, 8),
+            "risk_limit_triggers": result.risk_limit_triggers,
+            "blocked_entry_count": result.blocked_entry_count,
+        },
+    }
+
+
 async def account_inspector(config: AppConfig) -> CommandResult:
     async with make_client(config) as client:
         balance, positions, orders = await asyncio.gather(
@@ -426,6 +494,14 @@ def load_replay_fixture(path: Path | None) -> list[Bar]:
 def load_sma_replay_fixture(path: Path | None) -> list[Bar]:
     if path is None:
         return synthetic_sma_fixture()
+    if path.suffix.lower() == ".csv":
+        return _load_sma_csv_fixture(path)
+    return _load_bars_fixture(path)
+
+
+def load_ema_replay_fixture(path: Path | None) -> list[Bar]:
+    if path is None:
+        return synthetic_ema_fixture()
     if path.suffix.lower() == ".csv":
         return _load_sma_csv_fixture(path)
     return _load_bars_fixture(path)
@@ -623,6 +699,150 @@ def replay_sma_algo(
             },
             "evaluation": evaluation,
             **_sma_result_data(result),
+        },
+    )
+
+
+def replay_ema_algo(
+    config: AppConfig,
+    fixture: Path | None,
+    *,
+    buffer_override: float | None = None,
+    stop_override: float | None = None,
+    amount_override: float | None = None,
+    annualization_factor_override: float | None = None,
+    commission_rate_override: float | None = None,
+    slippage_bps_override: float | None = None,
+    commission_per_unit_override: float | None = None,
+    commission_round_turn_per_lot_override: float | None = None,
+    amount_per_lot_override: float | None = None,
+    spread_bps_override: float | None = None,
+    financing_bps_per_day_override: float | None = None,
+    market_impact_bps_override: float | None = None,
+    max_holding_hours: float | None = None,
+    max_trade_loss_pct: float | None = None,
+    max_daily_loss_pct: float | None = None,
+    max_drawdown_pct: float | None = None,
+    evaluation_start_index: int = 0,
+    evaluation_end_index: int | None = None,
+) -> CommandResult:
+    atr_buffer = config.strategy.ema_exit_buffer_atr if buffer_override is None else buffer_override
+    atr_stop_multiple = (
+        config.strategy.atr_stop_multiple if stop_override is None else stop_override
+    )
+    amount = config.trading.amount if amount_override is None else amount_override
+    period_type = _ema_period_type(config)
+    annualization_factor = (
+        _sma_annualization_factor(period_type)
+        if annualization_factor_override is None
+        else annualization_factor_override
+    )
+    commission_rate = (
+        config.strategy.commission_rate
+        if commission_rate_override is None
+        else commission_rate_override
+    )
+    slippage_bps = (
+        config.strategy.slippage_bps
+        if slippage_bps_override is None
+        else slippage_bps_override
+    )
+    commission_per_unit = (
+        config.strategy.commission_per_unit
+        if commission_per_unit_override is None
+        else commission_per_unit_override
+    )
+    commission_round_turn_per_lot = (
+        config.strategy.commission_round_turn_per_lot
+        if commission_round_turn_per_lot_override is None
+        else commission_round_turn_per_lot_override
+    )
+    amount_per_lot = (
+        config.trading.amount_per_lot
+        if amount_per_lot_override is None
+        else amount_per_lot_override
+    )
+    spread_bps = config.strategy.spread_bps if spread_bps_override is None else spread_bps_override
+    financing_bps_per_day = (
+        config.strategy.financing_bps_per_day
+        if financing_bps_per_day_override is None
+        else financing_bps_per_day_override
+    )
+    market_impact_bps = (
+        config.strategy.market_impact_bps
+        if market_impact_bps_override is None
+        else market_impact_bps_override
+    )
+    bars = load_ema_replay_fixture(fixture)
+    resolved_end_index = len(bars) if evaluation_end_index is None else evaluation_end_index
+    result = evaluate_ema_replay(
+        bars,
+        fast_period=config.strategy.ema_fast_period,
+        slow_period=config.strategy.ema_slow_period,
+        atr_period=config.strategy.atr_period,
+        atr_buffer=atr_buffer,
+        atr_stop_multiple=atr_stop_multiple,
+        amount=amount,
+        commission_rate=commission_rate,
+        slippage_bps=slippage_bps,
+        commission_per_unit=commission_per_unit,
+        commission_round_turn_per_lot=commission_round_turn_per_lot,
+        amount_per_lot=amount_per_lot,
+        spread_bps=spread_bps,
+        financing_bps_per_day=financing_bps_per_day,
+        market_impact_bps=market_impact_bps,
+        max_holding_hours=max_holding_hours,
+        max_trade_loss_pct=max_trade_loss_pct,
+        max_daily_loss_pct=max_daily_loss_pct,
+        max_drawdown_pct=max_drawdown_pct,
+        annualization_factor=annualization_factor,
+        evaluation_start_index=evaluation_start_index,
+        evaluation_end_index=resolved_end_index,
+    )
+    evaluation: dict[str, Any] = {
+        "start_index": evaluation_start_index,
+        "end_index": resolved_end_index,
+        "warmup_bar_count": evaluation_start_index,
+    }
+    if bars and 0 <= evaluation_start_index < len(bars) and 0 < resolved_end_index <= len(bars):
+        evaluation.update(
+            {
+                "start_time_ms": bars[evaluation_start_index].time_ms,
+                "end_time_ms": bars[resolved_end_index - 1].time_ms,
+            }
+        )
+    return CommandResult(
+        "ema-algo-demo",
+        result.outcome,
+        result.message,
+        {
+            "mode": "replay",
+            "contract": config.trading.contract,
+            "period_type": period_type,
+            "parameters": {
+                "fast_period": config.strategy.ema_fast_period,
+                "slow_period": config.strategy.ema_slow_period,
+                "atr_period": config.strategy.atr_period,
+                "atr_buffer": atr_buffer,
+                "atr_stop_multiple": atr_stop_multiple,
+                "amount": amount,
+                "commission_rate": commission_rate,
+                "slippage_bps": slippage_bps,
+                "commission_per_unit": commission_per_unit,
+                "commission_round_turn_per_lot": commission_round_turn_per_lot,
+                "amount_per_lot": amount_per_lot,
+                "spread_bps": spread_bps,
+                "financing_bps_per_day": financing_bps_per_day,
+                "market_impact_bps": market_impact_bps,
+                "max_holding_hours": max_holding_hours,
+                "max_trade_loss_pct": max_trade_loss_pct,
+                "max_daily_loss_pct": max_daily_loss_pct,
+                "max_drawdown_pct": max_drawdown_pct,
+                "annualization_factor": annualization_factor,
+                "execution": "next_tradable_bar",
+            },
+            "evaluation": evaluation,
+            **_ema_result_data(result),
         },
     )
 
@@ -1218,6 +1438,14 @@ def _sma_annualization_factor(period_type: int) -> float:
     return 252.0 * bars_per_day
 
 
+def _ema_period_type(config: AppConfig) -> int:
+    return (
+        config.strategy.sma_period_type
+        if config.strategy.ema_period_type is None
+        else config.strategy.ema_period_type
+    )
+
+
 def _market_data_details(
     bars: list[Bar],
     period_type: int,
@@ -1262,6 +1490,99 @@ def _market_data_issue_message(period_type: int, health: _MarketDataHealth) -> s
         )
         return f"Completed {period} market data contains an unexpected internal gap{count}."
     return f"Completed {period} market data is stale or missing."
+
+
+def _count_unrelated_positions(
+    positions: list[dict[str, Any]], tracked_ref: str | None
+) -> int:
+    return sum(
+        1
+        for position in positions
+        if str(position.get("ref") or position.get("orderRef")) != tracked_ref
+    )
+
+
+async def live_ema_algo(config: AppConfig, mode: str, execute: bool) -> CommandResult:
+    if mode != "live-observe" or execute:
+        raise LiveExecutionBlocked(
+            "EMA live execution is intentionally disabled; use EMA live-observe."
+        )
+    runtime_deadline = asyncio.get_running_loop().time() + config.trading.max_runtime_seconds
+    period_type = _ema_period_type(config)
+    last_bar_time = -1
+    async with make_client(config, require_chart=True) as client:
+        setting = find_contract_setting(
+            await client.get_contract_settings(), config.trading.contract
+        )
+        validate_amount(amount=config.trading.amount, contract_setting=setting)
+        while True:
+            if asyncio.get_running_loop().time() >= runtime_deadline:
+                return CommandResult(
+                    "ema-algo-demo",
+                    Outcome.NO_SIGNAL,
+                    "No EMA crossover occurred before the flat runtime limit.",
+                    {
+                        "mode": mode,
+                        "period_type": period_type,
+                        "max_runtime_seconds": config.trading.max_runtime_seconds,
+                    },
+                )
+            bars = await client.get_completed_bars(
+                contract=config.trading.contract,
+                period_type=period_type,
+                count=config.trading.bar_count,
+            )
+            health = _market_data_health(
+                bars,
+                period_type,
+                daily_break_start_utc=config.trading.market_data_daily_break_start_utc,
+                daily_break_end_utc=config.trading.market_data_daily_break_end_utc,
+                closed_dates_utc=config.trading.market_data_closed_dates_utc,
+            )
+            if health.unusable:
+                return CommandResult(
+                    "ema-algo-demo",
+                    Outcome.INCONCLUSIVE,
+                    _market_data_issue_message(period_type, health),
+                    {
+                        "mode": mode,
+                        "contract": config.trading.contract,
+                        "period_type": period_type,
+                        **_market_data_details(
+                            bars,
+                            period_type,
+                            health=health,
+                            daily_break_start_utc=config.trading.market_data_daily_break_start_utc,
+                            daily_break_end_utc=config.trading.market_data_daily_break_end_utc,
+                            closed_dates_utc=config.trading.market_data_closed_dates_utc,
+                        ),
+                    },
+                )
+            if not bars or bars[-1].time_ms == last_bar_time:
+                await asyncio.sleep(config.trading.poll_seconds)
+                continue
+            last_bar_time = bars[-1].time_ms
+            event = latest_ema_signal(
+                bars,
+                fast_period=config.strategy.ema_fast_period,
+                slow_period=config.strategy.ema_slow_period,
+                atr_period=config.strategy.atr_period,
+                atr_buffer=config.strategy.ema_exit_buffer_atr,
+                position_side=None,
+            )
+            if event is not None:
+                return CommandResult(
+                    "ema-algo-demo",
+                    Outcome.SUCCESS,
+                    "Live EMA signal observed; no order was submitted.",
+                    {
+                        "mode": mode,
+                        "contract": config.trading.contract,
+                        "period_type": period_type,
+                        "proposed_event": _ema_event_data([event])[0],
+                    },
+                )
+            await asyncio.sleep(config.trading.poll_seconds)
 
 
 async def live_algo(config: AppConfig, mode: str, execute: bool) -> CommandResult:
@@ -1477,21 +1798,19 @@ async def live_sma_algo(config: AppConfig, mode: str, execute: bool) -> CommandR
 
             positions = await client.get_positions()
             tracked_ref = journal.order_ref if journal is not None else None
-            unrelated_position_count = sum(
-                1
-                for position in positions
-                if str(position.get("ref") or position.get("orderRef")) != tracked_ref
-            )
-            if unrelated_position_count:
+            unrelated_position_count = _count_unrelated_positions(positions, tracked_ref)
+            if journal is None and len(positions) >= config.trading.max_total_open_positions:
                 return CommandResult(
                     "sma-algo-demo",
                     Outcome.BLOCKED,
-                    "Live SMA execution is blocked by unrelated open position(s).",
+                    "Live SMA execution is blocked by the maximum total open-position limit.",
                     {
                         "mode": mode,
                         "account_fingerprint": fingerprint,
+                        "open_position_count": len(positions),
                         "unrelated_position_count": unrelated_position_count,
-                        "max_open_positions": 1,
+                        "max_managed_positions": 1,
+                        "max_total_open_positions": config.trading.max_total_open_positions,
                     },
                 )
             if _account_level_risk_enabled(config):
@@ -1669,6 +1988,27 @@ async def live_sma_algo(config: AppConfig, mode: str, execute: bool) -> CommandR
                 if manager is None:
                     raise RuntimeError("Execution manager was not initialized.")
                 if event.signal is Signal.OPEN_BUY and owned_side is None:
+                    current_positions = await client.get_positions()
+                    current_tracked_ref = journal.order_ref if journal is not None else None
+                    unrelated_position_count = _count_unrelated_positions(
+                        current_positions, current_tracked_ref
+                    )
+                    if len(current_positions) >= config.trading.max_total_open_positions:
+                        return CommandResult(
+                            "sma-algo-demo",
+                            Outcome.BLOCKED,
+                            "Live SMA entry is blocked by the maximum total open-position limit.",
+                            {
+                                "mode": mode,
+                                "account_fingerprint": fingerprint,
+                                "open_position_count": len(current_positions),
+                                "unrelated_position_count": unrelated_position_count,
+                                "max_managed_positions": 1,
+                                "max_total_open_positions": (
+                                    config.trading.max_total_open_positions
+                                ),
+                            },
+                        )
                     quote = await read_quote(config)
                     entry_equity: float | None = None
                     if config.trading.max_trade_loss_pct is not None:

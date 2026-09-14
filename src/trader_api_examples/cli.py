@@ -14,11 +14,13 @@ from .commands import (
     execution_cost_audit,
     export_sma_bars,
     live_algo,
+    live_ema_algo,
     live_sma_algo,
     market_data_monitor,
     order_lifecycle,
     recover,
     replay_algo,
+    replay_ema_algo,
     replay_sma_algo,
 )
 from .config import ConfigError, load_config
@@ -35,6 +37,7 @@ COMMANDS = (
     "order-lifecycle-checker",
     "rsi-algo-demo",
     "sma-algo-demo",
+    "ema-algo-demo",
     "recover",
 )
 
@@ -97,6 +100,30 @@ def build_parser() -> argparse.ArgumentParser:
             child.add_argument("--max-drawdown-pct", type=float)
             child.add_argument("--evaluation-start-index", type=int, default=0)
             child.add_argument("--evaluation-end-index", type=int)
+        if command == "ema-algo-demo":
+            child.add_argument(
+                "--mode", choices=("replay", "live-observe", "live-execute"), default="replay"
+            )
+            child.add_argument("--execute", action="store_true")
+            child.add_argument("--fixture", type=Path)
+            child.add_argument("--buffer", type=float)
+            child.add_argument("--stop-multiple", type=float)
+            child.add_argument("--amount", type=float)
+            child.add_argument("--annualization-factor", type=float)
+            child.add_argument("--commission-rate", type=float)
+            child.add_argument("--slippage-bps", type=float)
+            child.add_argument("--commission-per-unit", type=float)
+            child.add_argument("--commission-round-turn-per-lot", type=float)
+            child.add_argument("--amount-per-lot", type=float)
+            child.add_argument("--spread-bps", type=float)
+            child.add_argument("--financing-bps-per-day", type=float)
+            child.add_argument("--market-impact-bps", type=float)
+            child.add_argument("--max-holding-hours", type=float)
+            child.add_argument("--max-trade-loss-pct", type=float)
+            child.add_argument("--max-daily-loss-pct", type=float)
+            child.add_argument("--max-drawdown-pct", type=float)
+            child.add_argument("--evaluation-start-index", type=int, default=0)
+            child.add_argument("--evaluation-end-index", type=int)
         if command == "market-data-monitor":
             child.add_argument("--bars-only", action="store_true")
     return parser
@@ -105,7 +132,10 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     output = getattr(args, "output", "human")
-    replay = args.command in {"rsi-algo-demo", "sma-algo-demo"} and args.mode == "replay"
+    replay = (
+        args.command in {"rsi-algo-demo", "sma-algo-demo", "ema-algo-demo"}
+        and args.mode == "replay"
+    )
     try:
         config = load_config(args.config, require_api_key=not replay)
         result = _run_command(args, config)
@@ -179,6 +209,31 @@ def _run_command(args: argparse.Namespace, config: object) -> CommandResult:
                 evaluation_end_index=args.evaluation_end_index,
             )
         return asyncio.run(live_sma_algo(config, args.mode, args.execute))
+    if args.command == "ema-algo-demo":
+        if args.mode == "replay":
+            return replay_ema_algo(
+                config,
+                args.fixture,
+                buffer_override=args.buffer,
+                stop_override=args.stop_multiple,
+                amount_override=args.amount,
+                annualization_factor_override=args.annualization_factor,
+                commission_rate_override=args.commission_rate,
+                slippage_bps_override=args.slippage_bps,
+                commission_per_unit_override=args.commission_per_unit,
+                commission_round_turn_per_lot_override=args.commission_round_turn_per_lot,
+                amount_per_lot_override=args.amount_per_lot,
+                spread_bps_override=args.spread_bps,
+                financing_bps_per_day_override=args.financing_bps_per_day,
+                market_impact_bps_override=args.market_impact_bps,
+                max_holding_hours=args.max_holding_hours,
+                max_trade_loss_pct=args.max_trade_loss_pct,
+                max_daily_loss_pct=args.max_daily_loss_pct,
+                max_drawdown_pct=args.max_drawdown_pct,
+                evaluation_start_index=args.evaluation_start_index,
+                evaluation_end_index=args.evaluation_end_index,
+            )
+        return asyncio.run(live_ema_algo(config, args.mode, args.execute))
     raise ValueError(f"Unknown command: {args.command}")
 
 

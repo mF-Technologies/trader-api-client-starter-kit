@@ -11,6 +11,8 @@ trading:
   # This account uses LLG as its XAUUSD/London Gold contract code.
   contract: LLG
   amount: 1000
+  # Account-wide ceiling; SMA execution manages at most one strategy-owned position.
+  max_total_open_positions: 1
   # API amount represented by one lot for lot-based replay commission conversion.
   amount_per_lot: 1
   # Flat signal-search budget; an open trade uses max_holding_hours instead.
@@ -38,8 +40,13 @@ strategy:
   sma_period_type: 1
   sma_fast_period: 20
   sma_slow_period: 50
+  # EMA follows sma_period_type unless explicitly set to 1, 2, or 3.
+  ema_period_type: null
+  ema_fast_period: 20
+  ema_slow_period: 50
   atr_period: 14
   sma_exit_buffer_atr: 0
+  ema_exit_buffer_atr: 0
   atr_stop_multiple: 2
   commission_rate: 0
   slippage_bps: 0

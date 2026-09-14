@@ -42,6 +42,8 @@ trader-api-examples market-data-monitor --config config.local.yaml
 trader-api-examples order-lifecycle-checker --config config.local.yaml
 trader-api-examples rsi-algo-demo --config config.local.yaml --mode replay
 trader-api-examples sma-algo-demo --config config.local.yaml --mode replay --buffer 0.5
+trader-api-examples ema-algo-demo --config config.local.yaml --mode replay --buffer 0.5
+trader-api-examples ema-algo-demo --config config.local.yaml --mode live-observe
 trader-api-examples sma-data-export --config config.local.yaml --output-file work/llg-1m.json --count 5000
 ```
 
@@ -262,6 +264,20 @@ across restarts. These account-level values are stored in `runtime/risk-<contrac
 and require the balance response to expose a positive `equity`, `balance`, or `available`
 value. A process crash still creates a monitoring gap; use `recover` when ownership or
 journal state is uncertain.
+
+## EMA20/EMA50 Algo
+
+`ema-algo-demo` is a separate moving-average experiment that uses EMA20 and EMA50 with
+the same long-only crossover, ATR14 buffer, ATR stop, next-bar replay execution, costs,
+and evaluation metrics as the SMA example. Its `strategy.ema_period_type` setting is
+optional; when omitted, it follows `strategy.sma_period_type` so the two experiments use
+the same candle interval. The EMA implementation and output use `EMA` names and do not
+modify the SMA command.
+
+EMA supports `replay` for historical testing and `live-observe` for read-only real-time
+signal monitoring. EMA live order submission is intentionally disabled for this separate
+experiment, so running it beside `sma-algo-demo` cannot create a second strategy-owned
+position or reuse the SMA execution journal.
 
 ## Live Execution
 
