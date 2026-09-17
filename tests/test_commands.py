@@ -111,6 +111,20 @@ def test_market_data_health_detects_stale_latest_bar() -> None:
     assert health.issue == "STALE_OR_MISSING_LATEST_BAR"
 
 
+def test_market_data_health_allows_configured_one_bar_publication_lag() -> None:
+    latest = datetime(2026, 1, 5, 10, tzinfo=UTC)
+
+    health = commands._market_data_health(
+        [bar_at(latest)],
+        1,
+        now=(latest + timedelta(minutes=2, seconds=30)).timestamp(),
+        max_age_intervals=3,
+    )
+
+    assert health.stale_latest_bar is False
+    assert health.unusable is False
+
+
 class FakeMarketDataClient:
     def __init__(self, bars: list[Bar]) -> None:
         self.bars = bars

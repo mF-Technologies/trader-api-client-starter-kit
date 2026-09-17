@@ -396,6 +396,14 @@ async def market_data_monitor(config: AppConfig, with_quote: bool) -> CommandRes
         "contract": config.trading.contract,
         "completed_bar_count": len(bars),
         "latest_completed_bar": vars(bars[-1]) if bars else None,
+        **_market_data_details(
+            bars,
+            config.strategy.period_type,
+            max_age_intervals=config.trading.market_data_max_age_intervals,
+            daily_break_start_utc=config.trading.market_data_daily_break_start_utc,
+            daily_break_end_utc=config.trading.market_data_daily_break_end_utc,
+            closed_dates_utc=config.trading.market_data_closed_dates_utc,
+        ),
     }
     if with_quote:
         quote = await read_quote(config)
@@ -1370,6 +1378,7 @@ def _market_data_health(
     period_type: int,
     *,
     now: float | None = None,
+    max_age_intervals: float = 2.0,
     daily_break_start_utc: str | None = "23:00",
     daily_break_end_utc: str | None = "01:00",
     closed_dates_utc: tuple[str, ...] = (),
@@ -1384,7 +1393,7 @@ def _market_data_health(
     duration_seconds = PERIOD_DURATION[period_type].total_seconds()
     latest_age_seconds = max(0.0, current_time - bars[-1].time_ms / 1000)
     stale_latest_bar = (
-        latest_age_seconds > duration_seconds * 2
+        latest_age_seconds > duration_seconds * max_age_intervals
         and not _is_expected_closed_now(
             current_time,
             period_type,
@@ -1415,6 +1424,7 @@ def _latest_is_stale(
     period_type: int,
     *,
     now: float | None = None,
+    max_age_intervals: float = 2.0,
     daily_break_start_utc: str | None = "23:00",
     daily_break_end_utc: str | None = "01:00",
     closed_dates_utc: tuple[str, ...] = (),
@@ -1423,6 +1433,7 @@ def _latest_is_stale(
         bars,
         period_type,
         now=now,
+        max_age_intervals=max_age_intervals,
         daily_break_start_utc=daily_break_start_utc,
         daily_break_end_utc=daily_break_end_utc,
         closed_dates_utc=closed_dates_utc,
@@ -1451,6 +1462,7 @@ def _market_data_details(
     period_type: int,
     *,
     health: _MarketDataHealth | None = None,
+    max_age_intervals: float = 2.0,
     daily_break_start_utc: str | None = "23:00",
     daily_break_end_utc: str | None = "01:00",
     closed_dates_utc: tuple[str, ...] = (),
@@ -1458,6 +1470,7 @@ def _market_data_details(
     health = health or _market_data_health(
         bars,
         period_type,
+        max_age_intervals=max_age_intervals,
         daily_break_start_utc=daily_break_start_utc,
         daily_break_end_utc=daily_break_end_utc,
         closed_dates_utc=closed_dates_utc,
@@ -1473,6 +1486,8 @@ def _market_data_details(
             if health.latest_bar_age_seconds is None
             else round(health.latest_bar_age_seconds, 3)
         ),
+        "max_age_intervals": max_age_intervals,
+        "max_age_seconds": PERIOD_DURATION[period_type].total_seconds() * max_age_intervals,
         "market_data_issue": health.issue,
         "gap_start_time_ms": health.gap_start_time_ms,
         "gap_end_time_ms": health.gap_end_time_ms,
@@ -1535,6 +1550,7 @@ async def live_ema_algo(config: AppConfig, mode: str, execute: bool) -> CommandR
             health = _market_data_health(
                 bars,
                 period_type,
+                max_age_intervals=config.trading.market_data_max_age_intervals,
                 daily_break_start_utc=config.trading.market_data_daily_break_start_utc,
                 daily_break_end_utc=config.trading.market_data_daily_break_end_utc,
                 closed_dates_utc=config.trading.market_data_closed_dates_utc,
@@ -1552,6 +1568,7 @@ async def live_ema_algo(config: AppConfig, mode: str, execute: bool) -> CommandR
                             bars,
                             period_type,
                             health=health,
+                            max_age_intervals=config.trading.market_data_max_age_intervals,
                             daily_break_start_utc=config.trading.market_data_daily_break_start_utc,
                             daily_break_end_utc=config.trading.market_data_daily_break_end_utc,
                             closed_dates_utc=config.trading.market_data_closed_dates_utc,
@@ -1623,6 +1640,7 @@ async def live_algo(config: AppConfig, mode: str, execute: bool) -> CommandResul
                 health = _market_data_health(
                     bars,
                     config.strategy.period_type,
+                    max_age_intervals=config.trading.market_data_max_age_intervals,
                     daily_break_start_utc=config.trading.market_data_daily_break_start_utc,
                     daily_break_end_utc=config.trading.market_data_daily_break_end_utc,
                     closed_dates_utc=config.trading.market_data_closed_dates_utc,
@@ -1638,6 +1656,7 @@ async def live_algo(config: AppConfig, mode: str, execute: bool) -> CommandResul
                                 bars,
                                 config.strategy.period_type,
                                 health=health,
+                                max_age_intervals=config.trading.market_data_max_age_intervals,
                                 daily_break_start_utc=(
                                     config.trading.market_data_daily_break_start_utc
                                 ),
@@ -1880,6 +1899,7 @@ async def live_sma_algo(config: AppConfig, mode: str, execute: bool) -> CommandR
                 health = _market_data_health(
                     bars,
                     config.strategy.sma_period_type,
+                    max_age_intervals=config.trading.market_data_max_age_intervals,
                     daily_break_start_utc=config.trading.market_data_daily_break_start_utc,
                     daily_break_end_utc=config.trading.market_data_daily_break_end_utc,
                     closed_dates_utc=config.trading.market_data_closed_dates_utc,
@@ -1896,6 +1916,7 @@ async def live_sma_algo(config: AppConfig, mode: str, execute: bool) -> CommandR
                                 bars,
                                 config.strategy.sma_period_type,
                                 health=health,
+                                max_age_intervals=config.trading.market_data_max_age_intervals,
                                 daily_break_start_utc=(
                                     config.trading.market_data_daily_break_start_utc
                                 ),

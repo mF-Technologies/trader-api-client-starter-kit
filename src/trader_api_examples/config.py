@@ -52,6 +52,10 @@ class TradingConfig:
     max_drawdown_pct: float | None = 10.0
     poll_seconds: float = 5.0
     bar_count: int = 200
+    # Completed-bar freshness limit, measured in expected bar intervals.
+    # Two intervals is the strict default; a local account may need one extra
+    # interval when the chart service consistently publishes one bar late.
+    market_data_max_age_intervals: float = 2.0
     # These are the session hours observed in the uploaded LLG/XAUUSD H1 history.
     # They are configurable because the broker's schedule is an account-level input.
     market_data_daily_break_start_utc: str | None = "23:00"
@@ -227,6 +231,13 @@ def _validate_config(config: AppConfig) -> None:
             ) from error
     if config.trading.bar_count < config.strategy.rsi_period + 2:
         raise ConfigError("trading.bar_count must provide enough completed bars for RSI.")
+    if (
+        not isfinite(config.trading.market_data_max_age_intervals)
+        or config.trading.market_data_max_age_intervals <= 1
+    ):
+        raise ConfigError(
+            "trading.market_data_max_age_intervals must be greater than one."
+        )
     if not 0 < config.strategy.oversold < config.strategy.exit_level:
         raise ConfigError("strategy.oversold must be below strategy.exit_level.")
     if not config.strategy.exit_level < config.strategy.overbought < 100:

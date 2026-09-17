@@ -118,12 +118,17 @@ submits a market order immediately afterward, which is the next tradable bar. At
 51 completed bars are needed before SMA20, SMA50, and ATR14 can produce a
 signal. `live-observe` reports the first signal without submitting an order.
 
-Live data health fails closed when the latest completed bar is more than two expected
-bar intervals old or when an unexpected internal gap is found. The default LLG session
-settings allow the observed 23:00-01:00 UTC daily break and weekend closure. Verify
-those hours against the account schedule and add known full-day holidays to
-`trading.market_data_closed_dates_utc` in the local configuration. An internal gap is
-reported as `INCONCLUSIVE`; the tool does not invent candles or submit a new order.
+Live data health fails closed when the latest completed bar is older than
+`trading.market_data_max_age_intervals` expected bar intervals or when an unexpected
+internal gap is found. The committed default is `2`. The local demo configuration uses
+`3` for M1 because the observed chart service can publish one completed bar late; this
+accepts a bar up to three minutes old and should be recorded as a data-latency limitation,
+not described as tick-level real time. Verify that allowance against the account feed
+before enabling execution. The default LLG session settings allow the observed
+23:00-01:00 UTC daily break and weekend closure. Verify those hours against the account
+schedule and add known full-day holidays to `trading.market_data_closed_dates_utc` in the
+local configuration. An internal gap is reported as `INCONCLUSIVE`; the tool does not
+invent candles or submit a new order.
 
 While long, the exit level is `SMA50 - (sma_exit_buffer_atr * ATR14)`. The default buffer
 is zero, which is the unbuffered bearish crossover. A positive buffer must be crossed from

@@ -24,6 +24,9 @@ trading:
   max_drawdown_pct: 10
   poll_seconds: 5
   bar_count: 200
+  # Completed-bar freshness limit. Keep at 2 unless the provider's delayed
+  # publication is measured and documented; 3 allows one delayed M1 bar.
+  market_data_max_age_intervals: 2
   # Observed LLG/XAUUSD session break in UTC. Verify this against the account schedule.
   market_data_daily_break_start_utc: "23:00"
   market_data_daily_break_end_utc: "01:00"
