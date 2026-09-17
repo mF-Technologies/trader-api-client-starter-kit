@@ -3,6 +3,7 @@ from pathlib import Path
 
 import pytest
 
+from trader_api_examples.api import ApiError
 from trader_api_examples.cli import build_parser, main
 
 
@@ -50,6 +51,33 @@ def test_algo_runner_uses_process_supervisor_by_default(
 
     assert exit_code == 17
     assert commands[0][-1] == "--worker"
+
+
+@pytest.mark.parametrize(
+    ("status_code", "expected_exit_code", "expected_outcome"),
+    [(502, 2, "[ERROR]"), (401, 4, "[BLOCKED]")],
+)
+def test_cli_classifies_transient_api_failures_for_supervisor_restart(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    status_code: int,
+    expected_exit_code: int,
+    expected_outcome: str,
+) -> None:
+    config = tmp_path / "config.yaml"
+    config.write_text("environment: demo\n", encoding="utf-8")
+    monkeypatch.setenv("TRADER_API_KEY", "api-key")
+
+    def raise_api_error(*_: object) -> None:
+        raise ApiError("token exchange returned an upstream error.", status_code)
+
+    monkeypatch.setattr("trader_api_examples.cli._run_command", raise_api_error)
+
+    exit_code = main(["account-inspector", "--config", str(config)])
+
+    assert exit_code == expected_exit_code
+    assert capsys.readouterr().out.startswith(expected_outcome)
 
 
 def test_replay_runs_without_api_key_and_writes_json(

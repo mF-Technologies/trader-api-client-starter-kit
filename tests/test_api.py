@@ -39,6 +39,94 @@ async def test_client_exchanges_key_and_reads_account_state() -> None:
 
 
 @pytest.mark.asyncio
+async def test_client_retries_transient_token_exchange_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    token_exchange_count = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal token_exchange_count
+        if request.url.path == "/api/tokens/auth":
+            token_exchange_count += 1
+            if token_exchange_count == 1:
+                return httpx.Response(502, json={"msg": "Bad Gateway"})
+            return httpx.Response(200, json={"access_token": "fx-token", "expires_in": 60})
+        if request.url.path == "/accountBalance":
+            assert request.headers["Authorization"] == "Bearer fx-token"
+            return httpx.Response(200, json={"balance": 1234.5})
+        raise AssertionError(f"Unexpected request: {request.method} {request.url}")
+
+    monkeypatch.setattr("trader_api_examples.api.TOKEN_EXCHANGE_RETRY_DELAY_SECONDS", 0)
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+        client = TraderApiClient(
+            web_proxy_url="https://web.example",
+            fxserver_url="https://fx.example",
+            chart_server_url="https://chart.example",
+            api_key="api-key",  # pragma: allowlist secret
+            http_client=http,
+        )
+        balance = await client.get_account_balance()
+
+    assert balance == {"balance": 1234.5}
+    assert token_exchange_count == 2
+
+
+@pytest.mark.asyncio
+async def test_client_retries_token_exchange_transport_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    token_exchange_count = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal token_exchange_count
+        if request.url.path != "/api/tokens/auth":
+            raise AssertionError(f"Unexpected request: {request.method} {request.url}")
+        token_exchange_count += 1
+        if token_exchange_count == 1:
+            raise httpx.ConnectError("connection reset", request=request)
+        return httpx.Response(200, json={"access_token": "fx-token", "expires_in": 60})
+
+    monkeypatch.setattr("trader_api_examples.api.TOKEN_EXCHANGE_RETRY_DELAY_SECONDS", 0)
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+        client = TraderApiClient(
+            web_proxy_url="https://web.example",
+            fxserver_url="https://fx.example",
+            chart_server_url="https://chart.example",
+            api_key="api-key",  # pragma: allowlist secret
+            http_client=http,
+        )
+
+        assert await client.access_token() == "fx-token"
+
+    assert token_exchange_count == 2
+
+
+@pytest.mark.asyncio
+async def test_client_does_not_retry_definitive_token_exchange_failure() -> None:
+    token_exchange_count = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal token_exchange_count
+        if request.url.path != "/api/tokens/auth":
+            raise AssertionError(f"Unexpected request: {request.method} {request.url}")
+        token_exchange_count += 1
+        return httpx.Response(401, json={"msg": "Unauthorized"})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+        client = TraderApiClient(
+            web_proxy_url="https://web.example",
+            fxserver_url="https://fx.example",
+            chart_server_url="https://chart.example",
+            api_key="api-key",  # pragma: allowlist secret
+            http_client=http,
+        )
+        with pytest.raises(ApiError, match="HTTP 401"):
+            await client.get_account_balance()
+
+    assert token_exchange_count == 1
+
+
+@pytest.mark.asyncio
 async def test_client_refreshes_access_token_after_expiry() -> None:
     token_exchange_count = 0
 

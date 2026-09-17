@@ -18,10 +18,13 @@ class ApiError(RuntimeError):
         message: str,
         status_code: int | None = None,
         error_code: str | None = None,
+        *,
+        transport_failure: bool = False,
     ) -> None:
         super().__init__(message)
         self.status_code = status_code
         self.error_code = error_code
+        self.transport_failure = transport_failure
 
     @property
     def is_definitive_rejection(self) -> bool:
@@ -33,7 +36,7 @@ class ApiError(RuntimeError):
 
     @property
     def is_transient_response(self) -> bool:
-        return self.status_code in {408, 425, 429} or (
+        return self.transport_failure or self.status_code in {408, 425, 429} or (
             self.status_code is not None and self.status_code >= 500
         )
 
@@ -77,6 +80,8 @@ PERIOD_DURATION = {
 }
 
 TOKEN_REFRESH_SKEW_SECONDS = 30.0
+TOKEN_EXCHANGE_MAX_ATTEMPTS = 3
+TOKEN_EXCHANGE_RETRY_DELAY_SECONDS = 1.0
 
 
 class TraderApiClient:
@@ -122,12 +127,26 @@ class TraderApiClient:
         async with self._access_token_lock:
             if not force and self._access_token_is_fresh():
                 return self._access_token
-            response = await self._request(
-                "POST",
-                f"{self._web_api}/tokens/auth",
-                headers={"Authorization": f"Bearer {self._api_key}"},
-                retry_unauthorized=False,
-            )
+            attempt = 0
+            while True:
+                try:
+                    response = await self._request(
+                        "POST",
+                        f"{self._web_api}/tokens/auth",
+                        headers={"Authorization": f"Bearer {self._api_key}"},
+                        retry_unauthorized=False,
+                    )
+                    break
+                except ApiError as error:
+                    attempt += 1
+                    if (
+                        not error.is_transient_response
+                        or attempt >= TOKEN_EXCHANGE_MAX_ATTEMPTS
+                    ):
+                        raise
+                    await asyncio.sleep(
+                        TOKEN_EXCHANGE_RETRY_DELAY_SECONDS * (2 ** (attempt - 1))
+                    )
             payload = self._object(response, "token exchange")
             token = payload.get("access_token")
             if not isinstance(token, str) or not token:
@@ -361,6 +380,11 @@ class TraderApiClient:
     async def _send_request(self, method: str, url: str, **kwargs: Any) -> httpx.Response:
         try:
             return await self._http.request(method, url, **kwargs)
+        except httpx.RequestError as error:
+            raise ApiError(
+                f"Trader API request failed: {method} {httpx.URL(url).path}",
+                transport_failure=True,
+            ) from error
         except httpx.HTTPError as error:
             raise ApiError(f"Trader API request failed: {method} {httpx.URL(url).path}") from error
 
