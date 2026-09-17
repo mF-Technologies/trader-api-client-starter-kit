@@ -77,7 +77,10 @@ def main(argv: Sequence[str] | None = None) -> int:
                 restart_delay_seconds=config.trading.market_data_retry_seconds,
             )
         result = _run_command(args, config)
-    except (ApiError, ConfigError, ContractError, LiveExecutionBlocked, ValueError) as error:
+    except ApiError as error:
+        outcome = Outcome.ERROR if error.is_transient_response else Outcome.BLOCKED
+        result = CommandResult(args.command, outcome, str(error), {})
+    except (ConfigError, ContractError, LiveExecutionBlocked, ValueError) as error:
         result = CommandResult(args.command, Outcome.BLOCKED, str(error), {})
     except (RuntimeError, TimeoutError) as error:
         result = CommandResult(args.command, Outcome.ERROR, str(error), {})
