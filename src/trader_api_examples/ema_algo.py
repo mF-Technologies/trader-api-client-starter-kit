@@ -668,12 +668,7 @@ def _buy_and_hold_curve(
         amount=amount,
         financing_bps_per_day=financing_bps_per_day,
     )
-    pnl = (
-        (exit_price - entry_price) * amount
-        - entry_commission
-        - exit_commission
-        - financing
-    )
+    pnl = (exit_price - entry_price) * amount - entry_commission - exit_commission - financing
     curve = [initial_equity]
     for bar in period_bars[1:]:
         mark_price = _sell_fill(bar.close, spread_bps=spread_bps)
@@ -685,10 +680,7 @@ def _buy_and_hold_curve(
             financing_bps_per_day=financing_bps_per_day,
         )
         curve.append(
-            initial_equity
-            + (mark_price - entry_price) * amount
-            - entry_commission
-            - carry
+            initial_equity + (mark_price - entry_price) * amount - entry_commission - carry
         )
     curve[-1] = initial_equity + pnl
     return curve, pnl
@@ -701,11 +693,7 @@ def _buy_fill(
     spread_bps: float = 0.0,
     market_impact_bps: float = 0.0,
 ) -> float:
-    return price * (
-        1.0
-        + spread_bps / 20_000.0
-        + (slippage_bps + market_impact_bps) / 10_000.0
-    )
+    return price * (1.0 + spread_bps / 20_000.0 + (slippage_bps + market_impact_bps) / 10_000.0)
 
 
 def _sell_fill(
@@ -715,11 +703,7 @@ def _sell_fill(
     spread_bps: float = 0.0,
     market_impact_bps: float = 0.0,
 ) -> float:
-    return price * (
-        1.0
-        - spread_bps / 20_000.0
-        - (slippage_bps + market_impact_bps) / 10_000.0
-    )
+    return price * (1.0 - spread_bps / 20_000.0 - (slippage_bps + market_impact_bps) / 10_000.0)
 
 
 def _financing_cost(

@@ -307,9 +307,7 @@ async def test_live_sma_allows_seven_unrelated_positions_with_eighth_position_ca
     async def read_safe_quote(*_args: object, **_kwargs: object) -> Quote:
         return Quote(contract="LLG", bid=100.0, ask=100.1, tag="test")
 
-    monkeypatch.setattr(
-        commands, "read_quote", read_safe_quote
-    )
+    monkeypatch.setattr(commands, "read_quote", read_safe_quote)
 
     class StopAfterOpen(Exception):
         pass
@@ -367,9 +365,7 @@ async def test_live_sma_open_position_uses_holding_limit_after_runtime(
 
         async def get_positions(self) -> list[dict[str, object]]:
             return (
-                [{"ref": "deal-42", "contract": "LLG", "amount": 10}]
-                if self.position_open
-                else []
+                [{"ref": "deal-42", "contract": "LLG", "amount": 10}] if self.position_open else []
             )
 
         async def get_position_detail(self, order_ref: str) -> dict[str, object] | None:
@@ -395,9 +391,11 @@ async def test_live_sma_open_position_uses_holding_limit_after_runtime(
     ).with_state(JournalState.OPEN, order_ref="deal-42")
 
     fake_loop_time = iter((0.0, 2.0))
-    monkeypatch.setattr(commands.asyncio, "get_running_loop", lambda: type(
-        "FakeLoop", (), {"time": lambda _self: next(fake_loop_time)}
-    )())
+    monkeypatch.setattr(
+        commands.asyncio,
+        "get_running_loop",
+        lambda: type("FakeLoop", (), {"time": lambda _self: next(fake_loop_time)})(),
+    )
     monkeypatch.setattr(commands.time, "time", lambda: now.timestamp())
     monkeypatch.setattr(commands, "make_client", lambda *_args, **_kwargs: fake_client)
     monkeypatch.setattr(commands, "_journal_path", lambda _config: journal_path)

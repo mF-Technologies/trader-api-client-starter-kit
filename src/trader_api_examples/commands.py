@@ -108,8 +108,7 @@ def _account_equity(balance: dict[str, Any]) -> float:
 
 def _account_level_risk_enabled(config: AppConfig) -> bool:
     return (
-        config.trading.max_daily_loss_pct is not None
-        or config.trading.max_drawdown_pct is not None
+        config.trading.max_daily_loss_pct is not None or config.trading.max_drawdown_pct is not None
     )
 
 
@@ -607,9 +606,7 @@ def replay_sma_algo(
         else commission_rate_override
     )
     slippage_bps = (
-        config.strategy.slippage_bps
-        if slippage_bps_override is None
-        else slippage_bps_override
+        config.strategy.slippage_bps if slippage_bps_override is None else slippage_bps_override
     )
     commission_per_unit = (
         config.strategy.commission_per_unit
@@ -751,9 +748,7 @@ def replay_ema_algo(
         else commission_rate_override
     )
     slippage_bps = (
-        config.strategy.slippage_bps
-        if slippage_bps_override is None
-        else slippage_bps_override
+        config.strategy.slippage_bps if slippage_bps_override is None else slippage_bps_override
     )
     commission_per_unit = (
         config.strategy.commission_per_unit
@@ -1499,17 +1494,13 @@ def _market_data_issue_message(period_type: int, health: _MarketDataHealth) -> s
     period = _period_label(period_type)
     if health.unexpected_internal_gap:
         count = (
-            f" of {health.missing_bar_count} bar(s)"
-            if health.missing_bar_count is not None
-            else ""
+            f" of {health.missing_bar_count} bar(s)" if health.missing_bar_count is not None else ""
         )
         return f"Completed {period} market data contains an unexpected internal gap{count}."
     return f"Completed {period} market data is stale or missing."
 
 
-def _count_unrelated_positions(
-    positions: list[dict[str, Any]], tracked_ref: str | None
-) -> int:
+def _count_unrelated_positions(positions: list[dict[str, Any]], tracked_ref: str | None) -> int:
     return sum(
         1
         for position in positions
@@ -1791,9 +1782,7 @@ async def live_sma_algo(config: AppConfig, mode: str, execute: bool) -> CommandR
                         "Execution journal belongs to a different account fingerprint."
                     )
                 if pending.contract != config.trading.contract:
-                    raise LiveExecutionBlocked(
-                        "Execution journal belongs to a different contract."
-                    )
+                    raise LiveExecutionBlocked("Execution journal belongs to a different contract.")
                 if pending.state is not JournalState.OPEN or not pending.order_ref:
                     raise LiveExecutionBlocked(
                         "An unresolved execution journal requires recovery before "
@@ -1836,10 +1825,7 @@ async def live_sma_algo(config: AppConfig, mode: str, execute: bool) -> CommandR
                 risk_state, _ = await _load_live_risk_state(config, client, fingerprint)
         try:
             while True:
-                if (
-                    owned_side is None
-                    and asyncio.get_running_loop().time() >= runtime_deadline
-                ):
+                if owned_side is None and asyncio.get_running_loop().time() >= runtime_deadline:
                     return CommandResult(
                         "sma-algo-demo",
                         Outcome.NO_SIGNAL,
@@ -1850,9 +1836,7 @@ async def live_sma_algo(config: AppConfig, mode: str, execute: bool) -> CommandR
                         },
                     )
                 if risk_state is not None:
-                    risk_state, equity = await _load_live_risk_state(
-                        config, client, fingerprint
-                    )
+                    risk_state, equity = await _load_live_risk_state(config, client, fingerprint)
                     risk_state, risk_reasons = _apply_live_risk_limits(
                         risk_state,
                         equity=equity,

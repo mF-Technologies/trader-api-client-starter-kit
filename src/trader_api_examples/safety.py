@@ -102,9 +102,7 @@ class Journal:
                 else None
             ),
             entry_time_ms=(
-                int(data["entry_time_ms"])
-                if data.get("entry_time_ms") is not None
-                else None
+                int(data["entry_time_ms"]) if data.get("entry_time_ms") is not None else None
             ),
             stop_price=(float(data["stop_price"]) if data.get("stop_price") is not None else None),
             entry_price=(

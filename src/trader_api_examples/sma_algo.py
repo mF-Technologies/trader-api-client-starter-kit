@@ -47,6 +47,7 @@ class SmaTrade:
     net_pnl: float
     exit_reason: str
 
+
 ## REplay results.
 @dataclass(frozen=True)
 class SmaBacktestResult:
@@ -65,6 +66,7 @@ class SmaBacktestResult:
     blocked_entry_count: int
     message: str
 
+
 ## Internal state for the currently open simulated trade.
 @dataclass
 class _OpenPosition:
@@ -74,6 +76,7 @@ class _OpenPosition:
     stop_price: float
     stop_reason: str
     entry_event: SmaSignalEvent
+
 
 ## how many candles are needed before the strategy can work.
 def required_bar_count(*, slow_period: int, atr_period: int) -> int:
@@ -88,6 +91,7 @@ def required_bar_count(*, slow_period: int, atr_period: int) -> int:
         slippage_bps=0.0,
     )
     return max(slow_period + 1, atr_period + 2)
+
 
 ## Extracts candles to calculate SMA & ATR values.
 def calculate_sma_indicators(
@@ -111,6 +115,7 @@ def calculate_sma_indicators(
         slow=talib.SMA(closes, timeperiod=slow_period),
         atr=talib.ATR(highs, lows, closes, timeperiod=atr_period),
     )
+
 
 ## The crossover entry & exit rules. ie SMA50 - (ATR buffer x ATR14)
 def latest_sma_signal(
@@ -145,6 +150,7 @@ def latest_sma_signal(
         position_side=position_side,
         atr_buffer=atr_buffer,
     )
+
 
 ## code for backtesting, takes all the historical data, sma periods etc.
 ## Read completed candle
@@ -581,6 +587,7 @@ def _mark_equity(
         equity += (mark_price - position.entry_price) * position.amount
     return equity
 
+
 ## calcs complete trade
 def _close_position(
     position: _OpenPosition,
@@ -679,12 +686,7 @@ def _buy_and_hold_curve(
         amount=amount,
         financing_bps_per_day=financing_bps_per_day,
     )
-    pnl = (
-        (exit_price - entry_price) * amount
-        - entry_commission
-        - exit_commission
-        - financing
-    )
+    pnl = (exit_price - entry_price) * amount - entry_commission - exit_commission - financing
     curve = [initial_equity]
     for bar in period_bars[1:]:
         mark_price = _sell_fill(bar.close, spread_bps=spread_bps)
@@ -696,10 +698,7 @@ def _buy_and_hold_curve(
             financing_bps_per_day=financing_bps_per_day,
         )
         curve.append(
-            initial_equity
-            + (mark_price - entry_price) * amount
-            - entry_commission
-            - carry
+            initial_equity + (mark_price - entry_price) * amount - entry_commission - carry
         )
     curve[-1] = initial_equity + pnl
     return curve, pnl
@@ -712,11 +711,7 @@ def _buy_fill(
     spread_bps: float = 0.0,
     market_impact_bps: float = 0.0,
 ) -> float:
-    return price * (
-        1.0
-        + spread_bps / 20_000.0
-        + (slippage_bps + market_impact_bps) / 10_000.0
-    )
+    return price * (1.0 + spread_bps / 20_000.0 + (slippage_bps + market_impact_bps) / 10_000.0)
 
 
 def _sell_fill(
@@ -726,11 +721,8 @@ def _sell_fill(
     spread_bps: float = 0.0,
     market_impact_bps: float = 0.0,
 ) -> float:
-    return price * (
-        1.0
-        - spread_bps / 20_000.0
-        - (slippage_bps + market_impact_bps) / 10_000.0
-    )
+    return price * (1.0 - spread_bps / 20_000.0 - (slippage_bps + market_impact_bps) / 10_000.0)
+
 
 ## holding cost estimte
 def _financing_cost(
@@ -852,13 +844,8 @@ def _validate_parameters(
         raise ValueError("slippage_bps must be finite and between zero and 10000.")
     if not isfinite(commission_per_unit) or commission_per_unit < 0:
         raise ValueError("commission_per_unit must be finite and not negative.")
-    if (
-        not isfinite(commission_round_turn_per_lot)
-        or commission_round_turn_per_lot < 0
-    ):
-        raise ValueError(
-            "commission_round_turn_per_lot must be finite and not negative."
-        )
+    if not isfinite(commission_round_turn_per_lot) or commission_round_turn_per_lot < 0:
+        raise ValueError("commission_round_turn_per_lot must be finite and not negative.")
     if not isfinite(amount_per_lot) or amount_per_lot <= 0:
         raise ValueError("amount_per_lot must be finite and greater than zero.")
     for name, value in (

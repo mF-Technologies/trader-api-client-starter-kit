@@ -235,9 +235,7 @@ def _validate_config(config: AppConfig) -> None:
         not isfinite(config.trading.market_data_max_age_intervals)
         or config.trading.market_data_max_age_intervals <= 1
     ):
-        raise ConfigError(
-            "trading.market_data_max_age_intervals must be greater than one."
-        )
+        raise ConfigError("trading.market_data_max_age_intervals must be greater than one.")
     if not 0 < config.strategy.oversold < config.strategy.exit_level:
         raise ConfigError("strategy.oversold must be below strategy.exit_level.")
     if not config.strategy.exit_level < config.strategy.overbought < 100:
@@ -253,9 +251,7 @@ def _validate_config(config: AppConfig) -> None:
         2,
         3,
     }:
-        raise ConfigError(
-            "strategy.ema_period_type must be 1 (minute), 2 (hourly), or 3 (daily)."
-        )
+        raise ConfigError("strategy.ema_period_type must be 1 (minute), 2 (hourly), or 3 (daily).")
     if config.strategy.ema_fast_period <= 0:
         raise ConfigError("strategy.ema_fast_period must be greater than zero.")
     if config.strategy.ema_fast_period >= config.strategy.ema_slow_period:
@@ -278,9 +274,7 @@ def _validate_config(config: AppConfig) -> None:
         not isfinite(config.strategy.commission_round_turn_per_lot)
         or config.strategy.commission_round_turn_per_lot < 0
     ):
-        raise ConfigError(
-            "strategy.commission_round_turn_per_lot must be finite and not negative."
-        )
+        raise ConfigError("strategy.commission_round_turn_per_lot must be finite and not negative.")
     for name, cost_value in (
         ("spread_bps", config.strategy.spread_bps),
         ("financing_bps_per_day", config.strategy.financing_bps_per_day),
