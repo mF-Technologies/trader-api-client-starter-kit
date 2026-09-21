@@ -1,12 +1,13 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from datetime import UTC, date, datetime
 from math import isfinite, sqrt
 
 import numpy as np
 import talib
 
+from .ai_risk import AccountContext, RiskAgent
 from .algo import Outcome
 from .api import Bar
 from .strategy import PositionSide, Signal
@@ -65,6 +66,9 @@ class SmaBacktestResult:
     risk_limit_triggers: dict[str, int]
     blocked_entry_count: int
     message: str
+    ai_risk_enabled: bool = False
+    ai_risk_decisions: list[dict[str, object]] = field(default_factory=list)
+    ai_risk_failures: int = 0
 
 
 ## Internal state for the currently open simulated trade.
@@ -185,6 +189,9 @@ def evaluate_sma_replay(
     annualization_factor: float = 252.0,
     evaluation_start_index: int = 0,
     evaluation_end_index: int | None = None,
+    risk_agent: RiskAgent | None = None,
+    ai_reduce_size_multiplier: float = 0.5,
+    contract: str = "LLG",
 ) -> SmaBacktestResult:
     _validate_parameters(
         fast_period=fast_period,
@@ -208,6 +215,8 @@ def evaluate_sma_replay(
     )
     if not isfinite(annualization_factor) or annualization_factor <= 0:
         raise ValueError("annualization_factor must be finite and greater than zero.")
+    if not isfinite(ai_reduce_size_multiplier) or not 0 < ai_reduce_size_multiplier <= 1:
+        raise ValueError("ai_reduce_size_multiplier must be greater than zero and at most one.")
     if len(bars) < required_bar_count(slow_period=slow_period, atr_period=atr_period):
         return _empty_result(Outcome.INCONCLUSIVE, "Not enough completed bars for SMA/ATR.")
     _validate_bars(bars)
@@ -228,7 +237,7 @@ def evaluate_sma_replay(
     equity_curve = [initial_equity]
     realized_pnl = 0.0
     position: _OpenPosition | None = None
-    pending_entry: tuple[int, SmaSignalEvent] | None = None
+    pending_entry: tuple[int, SmaSignalEvent, float] | None = None
     pending_exit: str | None = None
     current_day: date | None = None
     daily_start_equity = initial_equity
@@ -241,6 +250,8 @@ def evaluate_sma_replay(
         "MAX_DRAWDOWN": 0,
     }
     blocked_entry_count = 0
+    ai_risk_decisions: list[dict[str, object]] = []
+    ai_risk_failures = 0
 
     for index in range(evaluation_start_index, evaluation_end):
         bar = bars[index]
@@ -277,6 +288,7 @@ def evaluate_sma_replay(
 
         if pending_entry is not None and pending_entry[0] <= index and position is None:
             signal_event = pending_entry[1]
+            entry_amount = pending_entry[2]
             pending_entry = None
             if daily_loss_triggered or drawdown_triggered:
                 blocked_entry_count += 1
@@ -293,14 +305,14 @@ def evaluate_sma_replay(
                 if max_trade_loss_pct is not None:
                     entry_equity = initial_equity + realized_pnl
                     risk_budget = entry_equity * max_trade_loss_pct / 100.0
-                    loss_stop_price = entry_price - risk_budget / amount
+                    loss_stop_price = entry_price - risk_budget / entry_amount
                     if loss_stop_price > stop_price:
                         stop_price = loss_stop_price
                         stop_reason = "MAX_TRADE_LOSS"
                 position = _OpenPosition(
                     entry_time_ms=bar.time_ms,
                     entry_price=entry_price,
-                    amount=amount,
+                    amount=entry_amount,
                     stop_price=stop_price,
                     stop_reason=stop_reason,
                     entry_event=signal_event,
@@ -345,7 +357,68 @@ def evaluate_sma_replay(
                 )
                 events.append(signal_event)
                 if signal_event.signal is Signal.OPEN_BUY:
-                    pending_entry = (index + 1, signal_event)
+                    entry_amount = amount
+                    if risk_agent is not None and (daily_loss_triggered or drawdown_triggered):
+                        entry_amount = 0.0
+                    elif risk_agent is not None:
+                        context_equity = _mark_equity(
+                            initial_equity,
+                            realized_pnl,
+                            position,
+                            _sell_fill(bar.close, spread_bps=spread_bps),
+                        )
+                        context = AccountContext(
+                            environment="replay",
+                            contract=contract,
+                            signal=signal_event.signal.value,
+                            bar_time_ms=bar.time_ms,
+                            close=bar.close,
+                            fast_average=signal_event.sma_fast,
+                            slow_average=signal_event.sma_slow,
+                            atr=signal_event.atr,
+                            spread_bps=spread_bps,
+                            equity=context_equity,
+                            daily_pnl_pct=_percentage_change(daily_start_equity, context_equity),
+                            drawdown_pct=_percentage_change(
+                                peak_equity, context_equity, inverse=True
+                            ),
+                            open_positions=0,
+                            market_data_fresh=True,
+                        )
+                        try:
+                            decision = risk_agent.decide(context)
+                            if decision.action not in {"NORMAL", "REDUCE", "PAUSE"}:
+                                raise ValueError("AI risk response contained an invalid action.")
+                        except Exception as error:  # noqa: BLE001 - the overlay fails closed.
+                            decision = None
+                            entry_amount = 0.0
+                            ai_risk_failures += 1
+                            ai_risk_decisions.append(
+                                {
+                                    "signal_time_ms": signal_event.signal_time_ms,
+                                    "action": "PAUSE",
+                                    "reason": "AI risk agent unavailable; fail-closed.",
+                                    "confidence": None,
+                                    "failed": True,
+                                    "error_type": type(error).__name__,
+                                }
+                            )
+                        if decision is not None:
+                            ai_risk_decisions.append(
+                                {
+                                    "signal_time_ms": signal_event.signal_time_ms,
+                                    "action": decision.action,
+                                    "reason": decision.reason,
+                                    "confidence": decision.confidence,
+                                    "failed": False,
+                                }
+                            )
+                            if decision.action == "PAUSE":
+                                entry_amount = 0.0
+                            elif decision.action == "REDUCE":
+                                entry_amount = amount * ai_reduce_size_multiplier
+                    if entry_amount > 0:
+                        pending_entry = (index + 1, signal_event, entry_amount)
                 elif signal_event.signal is Signal.CLOSE_BUY and pending_exit is None:
                     pending_exit = signal_event.reason
 
@@ -447,6 +520,9 @@ def evaluate_sma_replay(
         risk_limit_triggers=risk_limit_triggers,
         blocked_entry_count=blocked_entry_count,
         message=message,
+        ai_risk_enabled=risk_agent is not None,
+        ai_risk_decisions=ai_risk_decisions,
+        ai_risk_failures=ai_risk_failures,
     )
 
 
@@ -586,6 +662,12 @@ def _mark_equity(
     if position is not None:
         equity += (mark_price - position.entry_price) * position.amount
     return equity
+
+
+def _percentage_change(base: float, current: float, *, inverse: bool = False) -> float:
+    if base <= 0:
+        return 0.0
+    return ((base - current) if inverse else (current - base)) / base * 100.0
 
 
 ## calcs complete trade

@@ -194,6 +194,46 @@ the remainder of the replay, respectively. Use them in staged comparisons:
 trader-api-examples sma-algo-demo --config config.local.yaml --mode replay --fixture .\XAUUSD_H1_200701010300_202609031700.csv --max-trade-loss-pct 1 --max-daily-loss-pct 2 --max-drawdown-pct 10
 ```
 
+### Bounded AI risk overlay (experimental)
+
+The normal replay command is the control: the deterministic SMA or EMA strategy makes the
+entry decision using fixed costs and fixed risk limits. The optional AI treatment calls an
+OpenAI Responses API model only when a bullish entry signal is detected. It receives a
+sanitized, point-in-time replay context and may return only `NORMAL`, `REDUCE`, or `PAUSE`:
+
+- `NORMAL` keeps the configured amount.
+- `REDUCE` uses `ai_risk.reduce_size_multiplier` (0.5 by default).
+- `PAUSE` blocks that entry.
+
+The AI cannot change moving-average periods, ATR stops, holding time, daily loss, drawdown,
+position limits, exits, or prices. A timeout, API error, malformed response, or invalid
+action fails closed as `PAUSE`. This overlay is replay-only; the CLI rejects it for both
+`live-observe` and `live-execute`, and it never submits an order. Historical account fields
+such as equity and drawdown are simulated from the replay equity curve rather than read from
+the live account.
+
+Keep the key and model name in `.env.local`, never in YAML or source control:
+
+```powershell
+OPENAI_API_KEY=...
+OPENAI_MODEL=...
+```
+
+Run the control and treatment separately on the same fixture and compare the recorded
+`ai_risk.decision_counts`, entry sizes, returns, drawdown, and failure count:
+
+```powershell
+# Control: no AI call
+trader-api-examples sma-algo-demo --config config.local.yaml --mode replay --fixture .\XAUUSD_H1_200701010300_202609031700.csv --output json
+
+# Treatment: bounded AI overlay; replay only
+trader-api-examples sma-algo-demo --config config.local.yaml --mode replay --fixture .\XAUUSD_H1_200701010300_202609031700.csv --ai-risk-agent --output json
+```
+
+Record the model, prompt version, fixture hash, costs, risk limits, and output JSON with the
+experiment. Do not treat one AI-assisted replay as evidence that the strategy is ready for
+live trading; first compare it with the control across the predeclared out-of-sample periods.
+
 To backtest real completed LLG candles, set `strategy.sma_period_type` to `1` for one-minute,
 `2` for hourly, or `3` for daily bars. Export them first and pass the resulting fixture to
 replay. For example, with hourly mode:

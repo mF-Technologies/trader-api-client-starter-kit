@@ -3,6 +3,7 @@ from typing import Any, cast
 
 import pytest
 
+from trader_api_examples.ai_risk import AccountContext, RiskDecision
 from trader_api_examples.algo import Outcome
 from trader_api_examples.api import Bar
 from trader_api_examples.sma_algo import (
@@ -76,6 +77,70 @@ def test_sma_replay_models_explicit_cost_components() -> None:
     assert costed.trades[0].financing > 0.0
     assert costed.strategy_return < baseline.strategy_return
     assert costed.buy_and_hold_return < baseline.buy_and_hold_return
+
+
+class StubRiskAgent:
+    def __init__(
+        self, decision: RiskDecision | None = None, error: Exception | None = None
+    ) -> None:
+        self.decision = decision
+        self.error = error
+        self.contexts: list[AccountContext] = []
+
+    def decide(self, context: AccountContext) -> RiskDecision:
+        self.contexts.append(context)
+        if self.error is not None:
+            raise self.error
+        assert self.decision is not None
+        return self.decision
+
+
+def test_sma_replay_ai_reduce_only_changes_entry_size() -> None:
+    agent = StubRiskAgent(RiskDecision("REDUCE", "Elevated volatility.", 0.8))
+
+    result = evaluate_sma_replay(
+        trend_reversal_bars(),
+        amount=100.0,
+        atr_stop_multiple=100.0,
+        risk_agent=agent,
+        ai_reduce_size_multiplier=0.5,
+    )
+
+    assert result.ai_risk_enabled is True
+    assert result.ai_risk_failures == 0
+    assert result.ai_risk_decisions[0]["action"] == "REDUCE"
+    assert result.trades[0].amount == 50.0
+    assert agent.contexts[0].market_data_fresh is True
+
+
+def test_sma_replay_ai_pause_blocks_entry() -> None:
+    agent = StubRiskAgent(RiskDecision("PAUSE", "Drawdown is too high.", 0.9))
+
+    result = evaluate_sma_replay(
+        trend_reversal_bars(),
+        amount=100.0,
+        atr_stop_multiple=100.0,
+        risk_agent=agent,
+    )
+
+    assert result.ai_risk_decisions[0]["action"] == "PAUSE"
+    assert result.trades == []
+
+
+def test_sma_replay_ai_failure_fails_closed() -> None:
+    agent = StubRiskAgent(error=RuntimeError("agent unavailable"))
+
+    result = evaluate_sma_replay(
+        trend_reversal_bars(),
+        amount=100.0,
+        atr_stop_multiple=100.0,
+        risk_agent=agent,
+    )
+
+    assert result.ai_risk_failures == 1
+    assert result.ai_risk_decisions[0]["action"] == "PAUSE"
+    assert result.ai_risk_decisions[0]["failed"] is True
+    assert result.trades == []
 
 
 def test_sma_replay_applies_round_turn_commission_per_lot_once() -> None:

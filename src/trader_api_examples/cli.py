@@ -16,6 +16,7 @@ from .commands import (
     live_algo,
     live_ema_algo,
     live_sma_algo,
+    make_replay_risk_agent,
     market_data_monitor,
     order_lifecycle,
     recover,
@@ -100,6 +101,11 @@ def build_parser() -> argparse.ArgumentParser:
             child.add_argument("--max-drawdown-pct", type=float)
             child.add_argument("--evaluation-start-index", type=int, default=0)
             child.add_argument("--evaluation-end-index", type=int)
+            child.add_argument(
+                "--ai-risk-agent",
+                action="store_true",
+                help="Use the bounded AI risk overlay during replay only.",
+            )
         if command == "ema-algo-demo":
             child.add_argument(
                 "--mode", choices=("replay", "live-observe", "live-execute"), default="replay"
@@ -124,6 +130,11 @@ def build_parser() -> argparse.ArgumentParser:
             child.add_argument("--max-drawdown-pct", type=float)
             child.add_argument("--evaluation-start-index", type=int, default=0)
             child.add_argument("--evaluation-end-index", type=int)
+            child.add_argument(
+                "--ai-risk-agent",
+                action="store_true",
+                help="Use the bounded AI risk overlay during replay only.",
+            )
         if command == "market-data-monitor":
             child.add_argument("--bars-only", action="store_true")
     return parser
@@ -185,6 +196,8 @@ def _run_command(args: argparse.Namespace, config: object) -> CommandResult:
             return replay_algo(config, args.fixture)
         return asyncio.run(live_algo(config, args.mode, args.execute))
     if args.command == "sma-algo-demo":
+        if args.ai_risk_agent and args.mode != "replay":
+            raise ValueError("--ai-risk-agent is available only with --mode replay.")
         if args.mode == "replay":
             return replay_sma_algo(
                 config,
@@ -207,9 +220,12 @@ def _run_command(args: argparse.Namespace, config: object) -> CommandResult:
                 max_drawdown_pct=args.max_drawdown_pct,
                 evaluation_start_index=args.evaluation_start_index,
                 evaluation_end_index=args.evaluation_end_index,
+                risk_agent=make_replay_risk_agent(config, enabled=args.ai_risk_agent),
             )
         return asyncio.run(live_sma_algo(config, args.mode, args.execute))
     if args.command == "ema-algo-demo":
+        if args.ai_risk_agent and args.mode != "replay":
+            raise ValueError("--ai-risk-agent is available only with --mode replay.")
         if args.mode == "replay":
             return replay_ema_algo(
                 config,
@@ -232,6 +248,7 @@ def _run_command(args: argparse.Namespace, config: object) -> CommandResult:
                 max_drawdown_pct=args.max_drawdown_pct,
                 evaluation_start_index=args.evaluation_start_index,
                 evaluation_end_index=args.evaluation_end_index,
+                risk_agent=make_replay_risk_agent(config, enabled=args.ai_risk_agent),
             )
         return asyncio.run(live_ema_algo(config, args.mode, args.execute))
     raise ValueError(f"Unknown command: {args.command}")

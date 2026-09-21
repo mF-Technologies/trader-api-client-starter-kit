@@ -121,6 +121,34 @@ strategy:
     assert config.secrets.api_key == "secret-api-key"  # pragma: allowlist secret
 
 
+def test_load_config_resolves_ai_risk_settings_from_dotenv(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config_path = tmp_path / "config.local.yaml"
+    config_path.write_text(
+        """
+environment: demo
+ai_risk:
+  timeout_seconds: 8
+  reduce_size_multiplier: 0.25
+""".strip(),
+        encoding="utf-8",
+    )
+    (tmp_path / ".env.local").write_text(
+        "OPENAI_API_KEY=ai-key\nOPENAI_MODEL=ai-model\n",  # pragma: allowlist secret
+        encoding="utf-8",
+    )
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.delenv("OPENAI_MODEL", raising=False)
+
+    config = load_config(config_path, require_api_key=False)
+
+    assert config.ai_risk.model == "ai-model"
+    assert config.ai_risk.timeout_seconds == 8.0
+    assert config.ai_risk.reduce_size_multiplier == 0.25
+    assert config.secrets.openai_api_key == "ai-key"  # pragma: allowlist secret
+
+
 def test_load_config_accepts_market_data_session_settings(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

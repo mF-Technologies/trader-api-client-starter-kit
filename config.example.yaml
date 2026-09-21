@@ -60,3 +60,13 @@ strategy:
   spread_bps: 0
   financing_bps_per_day: 0
   market_impact_bps: 0
+
+# Optional replay-only AI risk overlay. Enable it explicitly with
+# --ai-risk-agent; it cannot be used by live-observe or live-execute.
+ai_risk:
+  endpoint: https://api.openai.com/v1/responses
+  # Prefer OPENAI_MODEL in .env.local so the model choice is not hidden in code.
+  model: ""
+  timeout_seconds: 10
+  # REDUCE uses 50% of the configured replay amount.
+  reduce_size_multiplier: 0.5

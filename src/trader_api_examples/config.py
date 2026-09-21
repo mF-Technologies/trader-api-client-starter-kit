@@ -23,6 +23,7 @@ SENSITIVE_KEYS = {
     "username",
     "trade_key",
     "valid_generated_token",
+    "openai_api_key",
 }
 
 
@@ -91,10 +92,20 @@ class StrategyConfig:
 
 
 @dataclass(frozen=True)
+class AiRiskConfig:
+    # Replay-only overlay. The CLI flag is required before this is used.
+    endpoint: str = "https://api.openai.com/v1/responses"
+    model: str = ""
+    timeout_seconds: float = 10.0
+    reduce_size_multiplier: float = 0.5
+
+
+@dataclass(frozen=True)
 class Secrets:
     api_key: str
     username: str = ""
     trade_key: str = ""
+    openai_api_key: str = ""
 
 
 @dataclass(frozen=True)
@@ -103,6 +114,7 @@ class AppConfig:
     endpoints: EndpointsConfig = field(default_factory=EndpointsConfig)
     trading: TradingConfig = field(default_factory=TradingConfig)
     strategy: StrategyConfig = field(default_factory=StrategyConfig)
+    ai_risk: AiRiskConfig = field(default_factory=AiRiskConfig)
     secrets: Secrets = field(default_factory=lambda: Secrets(api_key=""))
     live_trading_enabled: bool = False
 
@@ -145,12 +157,17 @@ def load_config(path: Path, *, require_api_key: bool = True) -> AppConfig:
 
     local_environment = dict(dotenv_values(path.parent / ".env.local", encoding="utf-8"))
     api_key = _environment_value(local_environment, "TRADER_API_KEY")
+    openai_api_key = _environment_value(local_environment, "OPENAI_API_KEY")
+    openai_model = _environment_value(local_environment, "OPENAI_MODEL")
     if require_api_key and not api_key:
         raise ConfigError("Required environment variable is not set: TRADER_API_KEY")
 
     endpoints = _mapping(data.get("endpoints"), "endpoints")
     trading = _mapping(data.get("trading"), "trading")
     strategy = _mapping(data.get("strategy"), "strategy")
+    ai_risk = _mapping(data.get("ai_risk"), "ai_risk")
+    if not ai_risk.get("model") and openai_model:
+        ai_risk["model"] = openai_model
 
     closed_dates = trading.get("market_data_closed_dates_utc", ())
     if closed_dates is None:
@@ -168,10 +185,12 @@ def load_config(path: Path, *, require_api_key: bool = True) -> AppConfig:
         endpoints=EndpointsConfig(**endpoints),
         trading=TradingConfig(**trading),
         strategy=StrategyConfig(**strategy),
+        ai_risk=AiRiskConfig(**ai_risk),
         secrets=Secrets(
             api_key=api_key,
             username=_environment_value(local_environment, "TRADER_API_USERNAME"),
             trade_key=_environment_value(local_environment, "TRADER_API_TRADE_KEY"),
+            openai_api_key=openai_api_key,
         ),
         live_trading_enabled=(
             _environment_value(local_environment, "TRADER_API_ENABLE_LIVE_TRADING").lower()
@@ -183,6 +202,14 @@ def load_config(path: Path, *, require_api_key: bool = True) -> AppConfig:
 
 
 def _validate_config(config: AppConfig) -> None:
+    if not config.ai_risk.endpoint.startswith("https://"):
+        raise ConfigError("ai_risk.endpoint must use HTTPS.")
+    if not isfinite(config.ai_risk.timeout_seconds) or config.ai_risk.timeout_seconds <= 0:
+        raise ConfigError("ai_risk.timeout_seconds must be finite and greater than zero.")
+    if not 0 < config.ai_risk.reduce_size_multiplier <= 1:
+        raise ConfigError(
+            "ai_risk.reduce_size_multiplier must be greater than zero and at most one."
+        )
     if config.trading.amount <= 0:
         raise ConfigError("trading.amount must be greater than zero.")
     if (

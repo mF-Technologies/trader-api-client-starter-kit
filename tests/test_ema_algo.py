@@ -2,6 +2,7 @@ from dataclasses import replace
 
 import numpy as np
 
+from trader_api_examples.ai_risk import AccountContext, RiskDecision
 from trader_api_examples.algo import Outcome
 from trader_api_examples.api import Bar
 from trader_api_examples.ema_algo import (
@@ -85,6 +86,33 @@ def test_ema_replay_models_explicit_cost_components() -> None:
     assert costed.trades[0].commission >= 10.0
     assert costed.trades[0].financing > 0.0
     assert costed.strategy_return < baseline.strategy_return
+
+
+class StubRiskAgent:
+    def __init__(self, decision: RiskDecision) -> None:
+        self.decision = decision
+        self.contexts: list[AccountContext] = []
+
+    def decide(self, context: AccountContext) -> RiskDecision:
+        self.contexts.append(context)
+        return self.decision
+
+
+def test_ema_replay_ai_reduce_only_changes_entry_size() -> None:
+    agent = StubRiskAgent(RiskDecision("REDUCE", "Elevated volatility.", 0.8))
+
+    result = evaluate_ema_replay(
+        trend_reversal_bars(),
+        amount=100.0,
+        atr_stop_multiple=100.0,
+        risk_agent=agent,
+        ai_reduce_size_multiplier=0.5,
+    )
+
+    assert result.ai_risk_enabled is True
+    assert result.ai_risk_decisions[0]["action"] == "REDUCE"
+    assert result.trades[0].amount == 50.0
+    assert agent.contexts[0].market_data_fresh is True
 
 
 def test_ema_latest_signal_is_long_only_and_needs_valid_history() -> None:

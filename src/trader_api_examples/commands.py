@@ -15,6 +15,7 @@ from math import isfinite
 from pathlib import Path
 from typing import Any
 
+from .ai_risk import OpenAIRiskAgent, RiskAgent
 from .algo import AlgoResult, Outcome, evaluate_replay, latest_signal
 from .api import PERIOD_DURATION, Bar, TraderApiClient
 from .config import AppConfig
@@ -67,6 +68,17 @@ def make_client(config: AppConfig, *, require_chart: bool = False) -> TraderApiC
         fxserver_url=config.endpoints.fxserver_rest_url,
         chart_server_url=config.endpoints.chart_server_url,
         api_key=config.secrets.api_key,
+    )
+
+
+def make_replay_risk_agent(config: AppConfig, *, enabled: bool) -> RiskAgent | None:
+    if not enabled:
+        return None
+    return OpenAIRiskAgent(
+        api_key=config.secrets.openai_api_key,
+        model=config.ai_risk.model,
+        endpoint=config.ai_risk.endpoint,
+        timeout_seconds=config.ai_risk.timeout_seconds,
     )
 
 
@@ -341,6 +353,27 @@ def _ema_result_data(result: EmaBacktestResult) -> dict[str, Any]:
     }
 
 
+def _ai_risk_data(
+    *,
+    enabled: bool,
+    decisions: list[dict[str, object]],
+    failures: int,
+    reduce_size_multiplier: float,
+) -> dict[str, Any]:
+    counts = {"NORMAL": 0, "REDUCE": 0, "PAUSE": 0}
+    for decision in decisions:
+        action = decision.get("action")
+        if action in counts:
+            counts[action] += 1
+    return {
+        "enabled": enabled,
+        "reduce_size_multiplier": reduce_size_multiplier,
+        "decision_counts": counts,
+        "failure_count": failures,
+        "decisions": decisions,
+    }
+
+
 async def account_inspector(config: AppConfig) -> CommandResult:
     async with make_client(config) as client:
         balance, positions, orders = await asyncio.gather(
@@ -589,6 +622,7 @@ def replay_sma_algo(
     max_drawdown_pct: float | None = None,
     evaluation_start_index: int = 0,
     evaluation_end_index: int | None = None,
+    risk_agent: RiskAgent | None = None,
 ) -> CommandResult:
     atr_buffer = config.strategy.sma_exit_buffer_atr if buffer_override is None else buffer_override
     atr_stop_multiple = (
@@ -659,6 +693,9 @@ def replay_sma_algo(
         annualization_factor=annualization_factor,
         evaluation_start_index=evaluation_start_index,
         evaluation_end_index=resolved_end_index,
+        risk_agent=risk_agent,
+        ai_reduce_size_multiplier=config.ai_risk.reduce_size_multiplier,
+        contract=config.trading.contract,
     )
     evaluation: dict[str, Any] = {
         "start_index": evaluation_start_index,
@@ -703,6 +740,12 @@ def replay_sma_algo(
                 "execution": "next_tradable_bar",
             },
             "evaluation": evaluation,
+            "ai_risk": _ai_risk_data(
+                enabled=result.ai_risk_enabled,
+                decisions=result.ai_risk_decisions,
+                failures=result.ai_risk_failures,
+                reduce_size_multiplier=config.ai_risk.reduce_size_multiplier,
+            ),
             **_sma_result_data(result),
         },
     )
@@ -730,6 +773,7 @@ def replay_ema_algo(
     max_drawdown_pct: float | None = None,
     evaluation_start_index: int = 0,
     evaluation_end_index: int | None = None,
+    risk_agent: RiskAgent | None = None,
 ) -> CommandResult:
     atr_buffer = config.strategy.ema_exit_buffer_atr if buffer_override is None else buffer_override
     atr_stop_multiple = (
@@ -801,6 +845,9 @@ def replay_ema_algo(
         annualization_factor=annualization_factor,
         evaluation_start_index=evaluation_start_index,
         evaluation_end_index=resolved_end_index,
+        risk_agent=risk_agent,
+        ai_reduce_size_multiplier=config.ai_risk.reduce_size_multiplier,
+        contract=config.trading.contract,
     )
     evaluation: dict[str, Any] = {
         "start_index": evaluation_start_index,
@@ -845,6 +892,12 @@ def replay_ema_algo(
                 "execution": "next_tradable_bar",
             },
             "evaluation": evaluation,
+            "ai_risk": _ai_risk_data(
+                enabled=result.ai_risk_enabled,
+                decisions=result.ai_risk_decisions,
+                failures=result.ai_risk_failures,
+                reduce_size_multiplier=config.ai_risk.reduce_size_multiplier,
+            ),
             **_ema_result_data(result),
         },
     )

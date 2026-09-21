@@ -108,6 +108,77 @@ def test_ema_replay_exposes_ema_parameters() -> None:
     assert args.stop_multiple == 3.0
 
 
+def test_replay_exposes_bounded_ai_risk_flag() -> None:
+    parser = build_parser()
+
+    args = parser.parse_args(
+        [
+            "sma-algo-demo",
+            "--config",
+            "config.local.yaml",
+            "--mode",
+            "replay",
+            "--ai-risk-agent",
+        ]
+    )
+
+    assert args.ai_risk_agent is True
+
+
+def test_ai_risk_replay_fails_closed_before_network_without_api_key(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.delenv("TRADER_API_KEY", raising=False)
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.delenv("OPENAI_MODEL", raising=False)
+    config = tmp_path / "config.yaml"
+    config.write_text("environment: demo\n", encoding="utf-8")
+
+    exit_code = main(
+        [
+            "sma-algo-demo",
+            "--config",
+            str(config),
+            "--mode",
+            "replay",
+            "--ai-risk-agent",
+            "--output",
+            "json",
+        ]
+    )
+
+    payload = json.loads(capsys.readouterr().out)
+    assert exit_code == 4
+    assert payload["outcome"] == "BLOCKED"
+    assert "OPENAI_API_KEY" in payload["message"]
+
+
+def test_ai_risk_flag_is_rejected_for_live_modes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setenv("TRADER_API_KEY", "trader-key")  # pragma: allowlist secret
+    config = tmp_path / "config.yaml"
+    config.write_text("environment: demo\n", encoding="utf-8")
+
+    exit_code = main(
+        [
+            "sma-algo-demo",
+            "--config",
+            str(config),
+            "--mode",
+            "live-observe",
+            "--ai-risk-agent",
+            "--output",
+            "json",
+        ]
+    )
+
+    payload = json.loads(capsys.readouterr().out)
+    assert exit_code == 4
+    assert payload["outcome"] == "BLOCKED"
+    assert "only with --mode replay" in payload["message"]
+
+
 def test_sma_replay_runs_without_api_key_and_includes_benchmark(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
