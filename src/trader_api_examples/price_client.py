@@ -158,9 +158,7 @@ class PriceStreamSession:
         fx_connected = bool(getattr(event, "fx_server_connected", True))
         price_connected = bool(getattr(event, "price_agent_connected", True))
         if not fx_connected or not price_connected:
-            self._background_error = RuntimeError(
-                "FxServer or Price Agent reported a disconnect."
-            )
+            self._background_error = RuntimeError("FxServer or Price Agent reported a disconnect.")
 
     def _handle_loop_exception(
         self, loop: asyncio.AbstractEventLoop, context: dict[str, Any]

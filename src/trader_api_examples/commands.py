@@ -447,9 +447,7 @@ def _latest_is_stale_for_period(
     bars: list[Bar], period_type: int, grace_seconds: float = 60.0
 ) -> bool:
     age_seconds = _latest_bar_age_seconds(bars)
-    return age_seconds is None or age_seconds > _stale_threshold_seconds(
-        period_type, grace_seconds
-    )
+    return age_seconds is None or age_seconds > _stale_threshold_seconds(period_type, grace_seconds)
 
 
 def _write_instance_execution_summary(
@@ -572,8 +570,7 @@ async def _restore_runtime_state(
             )
         _write_console_status(
             f"REST:{instance.name}",
-            f"Previous position deal_ref={journal.order_ref} is already closed; "
-            "journal cleared.",
+            f"Previous position deal_ref={journal.order_ref} is already closed; journal cleared.",
         )
         return True
 
@@ -639,9 +636,7 @@ def _schedule_position_recovery_retry(
     first_failure = state.status != "position-recovery-pending"
     state.status = "position-recovery-pending"
     state.failure_reason = "position-recovery-pending"
-    state.next_position_recovery_retry_at = (
-        now + state.config.trading.market_data_retry_seconds
-    )
+    state.next_position_recovery_retry_at = now + state.config.trading.market_data_retry_seconds
     if state.event_log is not None:
         state.event_log.write(
             "POSITION_RECOVERY_PENDING" if first_failure else "POSITION_RECOVERY_RETRY_FAILED",
@@ -924,8 +919,7 @@ async def algo_runner(config: AppConfig, mode: str, execute: bool) -> CommandRes
                                     f"tag={'yes' if state.last_quote.tag else 'no'}",
                                 )
                                 state.next_price_log_at = (
-                                    quote_received_at
-                                    + instance.trading.price_log_interval_seconds
+                                    quote_received_at + instance.trading.price_log_interval_seconds
                                 )
                             state.status = "streaming"
                             try:

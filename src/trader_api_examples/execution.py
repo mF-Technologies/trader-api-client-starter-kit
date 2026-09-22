@@ -206,10 +206,7 @@ class ExecutionManager:
                         "open; awaiting confirmation.",
                         503,
                     ) from error
-                if (
-                    not is_retryable_cleanup_error(error)
-                    or attempt + 1 >= self.cleanup_attempts
-                ):
+                if not is_retryable_cleanup_error(error) or attempt + 1 >= self.cleanup_attempts:
                     raise
                 cleanup_client_order_id = self.client_order_id_factory()
                 journal = journal.with_state(
