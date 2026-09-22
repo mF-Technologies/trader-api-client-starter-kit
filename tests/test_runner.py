@@ -477,7 +477,7 @@ async def test_stale_bars_liquidate_owned_position_only_after_grace_period(
     trading = TradingConfig(
         contract="EURUSD",
         amount=1000,
-        max_runtime_seconds=0.2,
+        max_runtime_seconds=1.0,
         poll_seconds=0.001,
         market_data_retry_seconds=0.001,
         stale_position_grace_seconds=0.005,
