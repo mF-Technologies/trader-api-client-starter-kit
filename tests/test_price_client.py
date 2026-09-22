@@ -171,8 +171,7 @@ async def test_price_session_uses_price_update_listener() -> None:
 
 
 @pytest.mark.asyncio
-async def test_price_session_accepts_quiet_contract_when_shared_stream_is_active(
-) -> None:
+async def test_price_session_accepts_quiet_contract_when_shared_stream_is_active() -> None:
     client = ControllableListeningPriceClient()
     now = 100.0
 
@@ -189,8 +188,7 @@ async def test_price_session_accepts_quiet_contract_when_shared_stream_is_active
 
 
 @pytest.mark.asyncio
-async def test_price_session_restarts_when_shared_stream_stops_updating(
-) -> None:
+async def test_price_session_restarts_when_shared_stream_stops_updating() -> None:
     client = ControllableListeningPriceClient()
     now = 100.0
 

@@ -268,9 +268,7 @@ async def test_algo_runner_keeps_running_when_runtime_limit_is_omitted(
     monkeypatch.setattr("trader_api_examples.commands.HeartbeatWriter", lambda: FakeHeartbeat())
 
     with pytest.raises(TimeoutError):
-        await asyncio.wait_for(
-            algo_runner(config, "live-observe", execute=False), timeout=0.03
-        )
+        await asyncio.wait_for(algo_runner(config, "live-observe", execute=False), timeout=0.03)
 
     assert client.bar_calls >= 1
 

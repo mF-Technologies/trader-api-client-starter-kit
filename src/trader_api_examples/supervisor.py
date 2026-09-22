@@ -70,9 +70,7 @@ def run_supervisor(
                     process.kill()
                     process.wait()
                     exit_code = 2
-                    failure = (
-                        f"heartbeat timed out after {heartbeat_timeout_seconds:g}s"
-                    )
+                    failure = f"heartbeat timed out after {heartbeat_timeout_seconds:g}s"
                     break
         except KeyboardInterrupt:
             print("[Supervisor] Stopping algo worker...", file=sys.stderr, flush=True)
@@ -89,9 +87,7 @@ def run_supervisor(
 
         if failure is None:
             failure = (
-                "transport failed"
-                if exit_code == 2
-                else f"crashed with exit code {exit_code}"
+                "transport failed" if exit_code == 2 else f"crashed with exit code {exit_code}"
             )
         print(
             f"[Supervisor] Worker {failure}; restarting in {restart_delay_seconds:g}s...",

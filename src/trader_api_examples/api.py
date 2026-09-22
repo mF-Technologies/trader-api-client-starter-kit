@@ -36,15 +36,18 @@ class ApiError(RuntimeError):
 
     @property
     def is_transient_response(self) -> bool:
-        return self.transport_failure or self.status_code in {408, 425, 429} or (
-            self.status_code is not None and self.status_code >= 500
+        return (
+            self.transport_failure
+            or self.status_code in {408, 425, 429}
+            or (self.status_code is not None and self.status_code >= 500)
         )
 
     @property
     def is_duplicate_client_order_id(self) -> bool:
-        return self.status_code == 409 and (
-            self.error_code or ""
-        ).upper() == "DUPLICATE_CLIENT_ORDER_ID"
+        return (
+            self.status_code == 409
+            and (self.error_code or "").upper() == "DUPLICATE_CLIENT_ORDER_ID"
+        )
 
 
 @dataclass(frozen=True)
@@ -139,14 +142,9 @@ class TraderApiClient:
                     break
                 except ApiError as error:
                     attempt += 1
-                    if (
-                        not error.is_transient_response
-                        or attempt >= TOKEN_EXCHANGE_MAX_ATTEMPTS
-                    ):
+                    if not error.is_transient_response or attempt >= TOKEN_EXCHANGE_MAX_ATTEMPTS:
                         raise
-                    await asyncio.sleep(
-                        TOKEN_EXCHANGE_RETRY_DELAY_SECONDS * (2 ** (attempt - 1))
-                    )
+                    await asyncio.sleep(TOKEN_EXCHANGE_RETRY_DELAY_SECONDS * (2 ** (attempt - 1)))
             payload = self._object(response, "token exchange")
             token = payload.get("access_token")
             if not isinstance(token, str) or not token:
