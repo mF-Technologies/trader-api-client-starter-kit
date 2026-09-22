@@ -6,17 +6,27 @@ import json
 import secrets
 import sys
 import time
+from dataclasses import dataclass, field
 from importlib.resources import files
 from pathlib import Path
 from typing import Any
 
-from .algo import AlgoResult, Outcome, evaluate_replay, latest_signal
-from .api import PERIOD_DURATION, Bar, TraderApiClient
-from .config import AppConfig
+from .algo import (
+    AlgoResult,
+    Outcome,
+    SignalEvent,
+    evaluate_latest_strategy,
+    evaluate_replay,
+    latest_signal,
+    required_completed_bars,
+)
+from .api import PERIOD_DURATION, ApiError, Bar, TraderApiClient
+from .config import AlgoInstanceConfig, AppConfig
 from .contracts import calculate_amount, find_contract_setting, validate_amount
-from .execution import ExecutionManager
+from .execution import ExecutionManager, is_retryable_cleanup_error
 from .output import CommandResult
-from .price_client import read_quote
+from .price_client import PriceStreamSession, Quote, QuoteUnavailableError, read_quote
+from .runtime import HeartbeatWriter, InstanceEventLog, instance_journal_path
 from .safety import (
     Journal,
     JournalState,
@@ -69,15 +79,41 @@ def _write_execution_summary(config: AppConfig, fingerprint: str, side: str) -> 
 
 
 def _event_data(result: AlgoResult) -> list[dict[str, Any]]:
-    return [
-        {
+    events: list[dict[str, Any]] = []
+    for event in result.events:
+        item: dict[str, Any] = {
             "time_ms": event.time_ms,
             "signal": event.signal.value,
-            "rsi": event.rsi,
+            "strategy": event.strategy,
+            "indicator_value": event.indicator_value,
             "close": event.close,
         }
-        for event in result.events
-    ]
+        if event.strategy == "rsi":
+            item["rsi"] = event.indicator_value
+        events.append(item)
+    return events
+
+
+@dataclass
+class _InstanceRuntime:
+    config: AlgoInstanceConfig
+    deadline: float | None
+    manager: ExecutionManager | None = None
+    journal: Journal | None = None
+    owned_side: PositionSide | None = None
+    last_bar_time: int = -1
+    last_quote: Quote | None = None
+    history_loaded: bool = False
+    market_data_paused_at: float | None = None
+    next_market_data_retry_at: float = 0.0
+    next_position_recovery_retry_at: float = 0.0
+    next_cleanup_retry_at: float = 0.0
+    next_price_log_at: float = 0.0
+    failure_reason: str | None = None
+    events: list[SignalEvent] = field(default_factory=list)
+    status: str = "starting"
+    completed: bool = False
+    event_log: InstanceEventLog | None = None
 
 
 async def account_inspector(config: AppConfig) -> CommandResult:
@@ -238,17 +274,29 @@ async def order_lifecycle(config: AppConfig, execute: bool) -> CommandResult:
 
 
 def _latest_is_stale(bars: list[Bar], config: AppConfig) -> bool:
+    age_seconds = _latest_bar_age_seconds(bars)
+    return age_seconds is None or age_seconds > _stale_threshold_seconds(
+        config.strategy.period_type,
+        config.trading.bar_stale_grace_seconds,
+    )
+
+
+def _latest_bar_age_seconds(bars: list[Bar]) -> float | None:
     if not bars:
-        return True
-    duration = PERIOD_DURATION[config.strategy.period_type]
-    latest = bars[-1].time_ms / 1000
-    return time.time() - latest > duration.total_seconds() * 2
+        return None
+    return time.time() - bars[-1].time_ms / 1000
+
+
+def _stale_threshold_seconds(period_type: int, grace_seconds: float) -> float:
+    return PERIOD_DURATION[period_type].total_seconds() * 2 + grace_seconds
 
 
 async def live_algo(config: AppConfig, mode: str, execute: bool) -> CommandResult:
     if mode == "live-execute":
         assert_live_execution_enabled(enabled=config.live_trading_enabled, execute=execute)
-    deadline = asyncio.get_running_loop().time() + config.trading.max_runtime_seconds
+    loop = asyncio.get_running_loop()
+    runtime_seconds = config.trading.max_runtime_seconds
+    deadline = None if runtime_seconds is None else loop.time() + runtime_seconds
     fingerprint = account_fingerprint(config.secrets.api_key)
     manager: ExecutionManager | None = None
     journal: Journal | None = None
@@ -274,7 +322,7 @@ async def live_algo(config: AppConfig, mode: str, execute: bool) -> CommandResul
                     file=sys.stderr,
                 )
         try:
-            while asyncio.get_running_loop().time() < deadline:
+            while deadline is None or loop.time() < deadline:
                 bars = await client.get_completed_bars(
                     contract=config.trading.contract,
                     period_type=config.strategy.period_type,
@@ -381,55 +429,870 @@ async def live_algo(config: AppConfig, mode: str, execute: bool) -> CommandResul
     )
 
 
+def _runtime_data(state: _InstanceRuntime) -> dict[str, Any]:
+    quote = state.last_quote
+    return {
+        "contract": state.config.trading.contract,
+        "strategy": state.config.strategy.name,
+        "status": state.status,
+        "failure_reason": state.failure_reason,
+        "quote": (
+            {"bid": quote.bid, "ask": quote.ask, "tag_present": bool(quote.tag)} if quote else None
+        ),
+        "events": _event_data(AlgoResult(Outcome.SUCCESS, state.events, "")),
+    }
+
+
+def _latest_is_stale_for_period(
+    bars: list[Bar], period_type: int, grace_seconds: float = 60.0
+) -> bool:
+    age_seconds = _latest_bar_age_seconds(bars)
+    return age_seconds is None or age_seconds > _stale_threshold_seconds(
+        period_type, grace_seconds
+    )
+
+
+def _write_instance_execution_summary(
+    config: AppConfig,
+    state: _InstanceRuntime,
+    fingerprint: str,
+    event: SignalEvent,
+) -> None:
+    instance = state.config
+    side = "BUY" if event.signal is Signal.OPEN_BUY else "SELL"
+    print(
+        "Execution summary: "
+        f"account={fingerprint} environment={config.environment} instance={instance.name} "
+        f"contract={instance.trading.contract} side={side} amount={instance.trading.amount}",
+        file=sys.stderr,
+    )
+
+
+def _write_console_status(scope: str, message: str) -> None:
+    print(f"[{scope}] {message}", file=sys.stderr, flush=True)
+
+
+def _indicator_summary(indicators: dict[str, float]) -> str:
+    if not indicators:
+        return "none"
+    return ",".join(f"{name}={value}" for name, value in sorted(indicators.items()))
+
+
+async def _cleanup_runtime_state(state: _InstanceRuntime, *, execute: bool) -> None:
+    if state.journal is None or state.manager is None:
+        return
+    if state.journal.path.exists():
+        persisted = Journal.load(state.journal.path)
+        if persisted.run_id == state.journal.run_id:
+            state.journal = persisted
+    client_order_id = state.journal.cleanup_client_order_id or _client_order_id()
+    if state.event_log is not None:
+        state.event_log.write(
+            "LIQUIDATE_SUBMITTED",
+            deal_ref=state.journal.order_ref,
+            client_order_id=client_order_id,
+        )
+    _write_console_status(
+        f"REST:{state.config.name}",
+        f"Liquidating deal_ref={state.journal.order_ref} client_order_id={client_order_id}",
+    )
+    cleanup_ref = await state.manager.cleanup(
+        journal=state.journal,
+        execute=execute,
+        client_order_id=client_order_id,
+    )
+    if state.event_log is not None:
+        state.event_log.write(
+            "POSITION_CLOSED",
+            deal_ref=state.journal.order_ref,
+            cleanup_ref=cleanup_ref,
+        )
+    _write_console_status(f"REST:{state.config.name}", f"Position closed cleanup_ref={cleanup_ref}")
+    state.journal = None
+    state.owned_side = None
+
+
+async def _restore_runtime_state(
+    state: _InstanceRuntime,
+    *,
+    account_fingerprint: str,
+    execute: bool,
+    now: float,
+) -> bool:
+    manager = state.manager
+    if manager is None or not manager.journal_path.exists():
+        return True
+    journal = Journal.load(manager.journal_path)
+    instance = state.config
+    if journal.account_fingerprint != account_fingerprint:
+        raise LiveExecutionBlocked(
+            f"Execution journal for {instance.name} belongs to a different account."
+        )
+    if journal.contract.upper() != instance.trading.contract.upper():
+        raise LiveExecutionBlocked(
+            f"Execution journal for {instance.name} belongs to a different contract."
+        )
+    if journal.state in {JournalState.PENDING_SUBMISSION, JournalState.OWNERSHIP_UNCONFIRMED}:
+        previous_state = journal.state
+        reconciled = await manager.reconcile_submission(journal=journal)
+        if reconciled is None:
+            _schedule_position_recovery_retry(
+                state,
+                error=ApiError(
+                    f"Execution ownership for {instance.name} is still unresolved.",
+                    503,
+                ),
+                now=now,
+            )
+            return False
+        journal = reconciled
+        if state.event_log is not None:
+            state.event_log.write(
+                "POSITION_RECONCILED",
+                deal_ref=journal.order_ref,
+                previous_state=previous_state.value,
+            )
+        _write_console_status(
+            f"REST:{instance.name}",
+            f"Reconciled submitted position deal_ref={journal.order_ref}; resuming.",
+        )
+    if journal.side not in {"BUY", "SELL"} or not journal.order_ref:
+        raise LiveExecutionBlocked(f"Execution journal for {instance.name} is invalid.")
+
+    position = await manager.client.get_position_detail(journal.order_ref)
+    if position is None:
+        journal.clear()
+        state.status = "journal-reconciled"
+        state.failure_reason = None
+        if state.event_log is not None:
+            state.event_log.write(
+                "JOURNAL_RECONCILED",
+                previous_state=journal.state.value,
+                deal_ref=journal.order_ref,
+            )
+        _write_console_status(
+            f"REST:{instance.name}",
+            f"Previous position deal_ref={journal.order_ref} is already closed; "
+            "journal cleared.",
+        )
+        return True
+
+    state.journal = journal
+    state.owned_side = PositionSide.LONG if journal.side == "BUY" else PositionSide.SHORT
+    state.status = "position-restored"
+    state.failure_reason = None
+    if state.event_log is not None:
+        state.event_log.write(
+            "POSITION_RESTORED",
+            deal_ref=journal.order_ref,
+            side=journal.side,
+            amount=journal.amount,
+            previous_state=journal.state.value,
+        )
+    _write_console_status(
+        f"REST:{instance.name}",
+        f"Restored owned position deal_ref={journal.order_ref} side={journal.side} "
+        f"amount={journal.amount}",
+    )
+    if journal.state is JournalState.CLEANUP_PENDING:
+        _write_console_status(
+            f"REST:{instance.name}",
+            "Previous cleanup was interrupted; retrying before strategy resumes.",
+        )
+        await _cleanup_runtime_state(state, execute=execute)
+        state.status = "cleanup-reconciled"
+    return True
+
+
+def _api_error_label(error: ApiError) -> str:
+    if error.error_code:
+        return error.error_code
+    if error.status_code is not None:
+        return f"HTTP {error.status_code}"
+    return "transient API error"
+
+
+def _schedule_cleanup_retry(state: _InstanceRuntime, *, error: ApiError, now: float) -> None:
+    state.status = "cleanup-pending"
+    state.next_cleanup_retry_at = now + state.config.trading.market_data_retry_seconds
+    if state.event_log is not None:
+        state.event_log.write(
+            "CLEANUP_RETRY_SCHEDULED",
+            deal_ref=state.journal.order_ref if state.journal else None,
+            error_code=error.error_code,
+            retry_seconds=state.config.trading.market_data_retry_seconds,
+        )
+    _write_console_status(
+        f"REST:{state.config.name}",
+        f"Cleanup temporarily unavailable ({_api_error_label(error)}); position remains tracked. "
+        f"Retrying in {state.config.trading.market_data_retry_seconds:g}s. "
+        "Other instances continue.",
+    )
+
+
+def _schedule_position_recovery_retry(
+    state: _InstanceRuntime,
+    *,
+    error: ApiError,
+    now: float,
+) -> None:
+    first_failure = state.status != "position-recovery-pending"
+    state.status = "position-recovery-pending"
+    state.failure_reason = "position-recovery-pending"
+    state.next_position_recovery_retry_at = (
+        now + state.config.trading.market_data_retry_seconds
+    )
+    if state.event_log is not None:
+        state.event_log.write(
+            "POSITION_RECOVERY_PENDING" if first_failure else "POSITION_RECOVERY_RETRY_FAILED",
+            error_code=error.error_code,
+            status_code=error.status_code,
+            retry_seconds=state.config.trading.market_data_retry_seconds,
+        )
+    _write_console_status(
+        f"REST:{state.config.name}",
+        f"Position recovery temporarily unavailable ({_api_error_label(error)}); "
+        "journal retained and no trading will resume until position is confirmed. "
+        f"Retrying in {state.config.trading.market_data_retry_seconds:g}s.",
+    )
+
+
+async def _try_restore_runtime_state(
+    state: _InstanceRuntime,
+    *,
+    account_fingerprint: str,
+    execute: bool,
+    now: float,
+) -> bool:
+    try:
+        restored = await _restore_runtime_state(
+            state,
+            account_fingerprint=account_fingerprint,
+            execute=execute,
+            now=now,
+        )
+    except ApiError as error:
+        if state.journal is None:
+            if not error.is_transient_response:
+                raise
+            _schedule_position_recovery_retry(state, error=error, now=now)
+            return False
+        if not is_retryable_cleanup_error(error):
+            raise
+        _schedule_cleanup_retry(state, error=error, now=now)
+        return False
+    return restored
+
+
+async def _cleanup_or_schedule_retry(
+    state: _InstanceRuntime,
+    *,
+    execute: bool,
+    now: float,
+) -> bool:
+    try:
+        await _cleanup_runtime_state(state, execute=execute)
+    except ApiError as error:
+        if not is_retryable_cleanup_error(error):
+            raise
+        _schedule_cleanup_retry(state, error=error, now=now)
+        return False
+    return True
+
+
+async def _pause_runtime_state(
+    state: _InstanceRuntime,
+    *,
+    status: str,
+    message: str,
+    execute: bool,
+    now: float,
+) -> None:
+    first_failure = state.market_data_paused_at is None
+    if first_failure:
+        state.market_data_paused_at = now
+    state.status = status
+    state.failure_reason = status
+    state.next_market_data_retry_at = now + state.config.trading.market_data_retry_seconds
+    if state.event_log is not None:
+        state.event_log.write(
+            "MARKET_DATA_PAUSED" if first_failure else "MARKET_DATA_RETRY_FAILED",
+            status=status,
+            message=message,
+            retry_seconds=state.config.trading.market_data_retry_seconds,
+        )
+    _write_console_status(
+        f"Strategy:{state.config.name}",
+        f"Market data paused status={status}: {message} "
+        f"Retrying in {state.config.trading.market_data_retry_seconds:g}s.",
+    )
+    if (
+        state.journal is not None
+        and state.market_data_paused_at is not None
+        and now - state.market_data_paused_at >= state.config.trading.stale_position_grace_seconds
+    ):
+        _write_console_status(
+            f"Strategy:{state.config.name}",
+            "Market data grace period expired; cleaning up the owned position.",
+        )
+        await _cleanup_or_schedule_retry(state, execute=execute, now=now)
+
+
+def _recover_runtime_state(state: _InstanceRuntime, *, now: float) -> None:
+    if state.market_data_paused_at is None:
+        return
+    paused_seconds = round(now - state.market_data_paused_at, 3)
+    if state.event_log is not None:
+        state.event_log.write("MARKET_DATA_RECOVERED", paused_seconds=paused_seconds)
+    _write_console_status(
+        f"Strategy:{state.config.name}",
+        f"Market data recovered after {paused_seconds:g}s; strategy resumed.",
+    )
+    state.market_data_paused_at = None
+    state.next_market_data_retry_at = 0.0
+    state.failure_reason = None
+    state.status = "streaming"
+
+
+async def algo_runner(config: AppConfig, mode: str, execute: bool) -> CommandResult:
+    if mode == "live-execute":
+        assert_live_execution_enabled(enabled=config.live_trading_enabled, execute=execute)
+    elif execute:
+        raise LiveExecutionBlocked("--execute is only valid with --mode live-execute.")
+
+    loop = asyncio.get_running_loop()
+    fingerprint = account_fingerprint(config.secrets.api_key)
+    states = [
+        _InstanceRuntime(
+            config=instance,
+            deadline=(
+                None
+                if instance.trading.max_runtime_seconds is None
+                else loop.time() + instance.trading.max_runtime_seconds
+            ),
+            event_log=InstanceEventLog(instance.name),
+        )
+        for instance in config.algo_instances
+    ]
+    heartbeat = HeartbeatWriter()
+
+    _write_console_status(
+        "Runner",
+        f"Starting mode={mode} environment={config.environment} instances={len(states)} "
+        f"account={fingerprint}",
+    )
+
+    for state in states:
+        instance = state.config
+        assert state.event_log is not None
+        state.event_log.write(
+            "STARTED",
+            mode=mode,
+            environment=config.environment,
+            contract=instance.trading.contract,
+            amount=instance.trading.amount,
+            strategy=instance.strategy.name,
+            period_type=instance.strategy.period_type,
+        )
+        _write_console_status(
+            f"Strategy:{instance.name}",
+            f"Initialized contract={instance.trading.contract} "
+            f"strategy={instance.strategy.name} period_type={instance.strategy.period_type} "
+            f"amount={instance.trading.amount}",
+        )
+
+    try:
+        async with make_client(config, require_chart=True) as client:
+            settings = await client.get_contract_settings()
+            for state in states:
+                setting = find_contract_setting(settings, state.config.trading.contract)
+                validate_amount(amount=state.config.trading.amount, contract_setting=setting)
+                _write_console_status(
+                    f"REST:{state.config.name}",
+                    f"Contract settings validated for {state.config.trading.contract}",
+                )
+                if mode == "live-execute":
+                    state.manager = ExecutionManager(
+                        client=client,
+                        journal_path=instance_journal_path(
+                            state.config.name, state.config.trading.contract
+                        ),
+                        live_trading_enabled=config.live_trading_enabled,
+                        poll_seconds=min(1.0, state.config.trading.poll_seconds),
+                        cleanup_attempts=1,
+                    )
+                    await _try_restore_runtime_state(
+                        state,
+                        account_fingerprint=fingerprint,
+                        execute=execute,
+                        now=loop.time(),
+                    )
+
+            async with PriceStreamSession(config) as price_session:
+                _write_console_status("Price", "Shared price session connected")
+                for state in states:
+                    assert state.event_log is not None
+                    state.event_log.write("PRICE_SESSION_CONNECTED")
+                try:
+                    while any(not state.completed for state in states):
+                        for state in states:
+                            if state.completed:
+                                continue
+                            instance = state.config
+                            now = loop.time()
+                            if state.status == "position-recovery-pending":
+                                if now < state.next_position_recovery_retry_at:
+                                    await asyncio.sleep(0.05)
+                                    continue
+                                await _try_restore_runtime_state(
+                                    state,
+                                    account_fingerprint=fingerprint,
+                                    execute=execute,
+                                    now=loop.time(),
+                                )
+                                if state.status in {
+                                    "position-recovery-pending",
+                                    "cleanup-pending",
+                                }:
+                                    continue
+                            if state.status == "cleanup-pending":
+                                if now < state.next_cleanup_retry_at:
+                                    continue
+                                if not await _cleanup_or_schedule_retry(
+                                    state,
+                                    execute=execute,
+                                    now=loop.time(),
+                                ):
+                                    continue
+                                state.next_cleanup_retry_at = 0.0
+                                state.status = "cleanup-reconciled"
+                            if state.deadline is not None and now >= state.deadline:
+                                if not await _cleanup_or_schedule_retry(
+                                    state,
+                                    execute=execute,
+                                    now=loop.time(),
+                                ):
+                                    continue
+                                if state.market_data_paused_at is None:
+                                    state.status = "runtime-limit"
+                                state.completed = True
+                                continue
+                            if (
+                                state.market_data_paused_at is not None
+                                and now < state.next_market_data_retry_at
+                            ):
+                                if (
+                                    state.journal is not None
+                                    and now - state.market_data_paused_at
+                                    >= instance.trading.stale_position_grace_seconds
+                                ):
+                                    _write_console_status(
+                                        f"Strategy:{instance.name}",
+                                        "Market data grace period expired; cleaning up the "
+                                        "owned position.",
+                                    )
+                                    if not await _cleanup_or_schedule_retry(
+                                        state,
+                                        execute=execute,
+                                        now=loop.time(),
+                                    ):
+                                        continue
+                                continue
+
+                            try:
+                                state.last_quote = await price_session.get_quote(
+                                    instance.trading.contract,
+                                    timeout_seconds=max(
+                                        1.0, min(10.0, instance.trading.poll_seconds * 2)
+                                    ),
+                                )
+                            except QuoteUnavailableError as error:
+                                await _pause_runtime_state(
+                                    state,
+                                    status="stale-quote",
+                                    message=str(error),
+                                    execute=execute,
+                                    now=loop.time(),
+                                )
+                                continue
+                            quote_received_at = loop.time()
+                            if quote_received_at >= state.next_price_log_at:
+                                _write_console_status(
+                                    f"Price:{instance.name}",
+                                    f"{instance.trading.contract} bid={state.last_quote.bid} "
+                                    f"ask={state.last_quote.ask} "
+                                    f"tag={'yes' if state.last_quote.tag else 'no'}",
+                                )
+                                state.next_price_log_at = (
+                                    quote_received_at
+                                    + instance.trading.price_log_interval_seconds
+                                )
+                            state.status = "streaming"
+                            try:
+                                bars = await client.get_completed_bars(
+                                    contract=instance.trading.contract,
+                                    period_type=instance.strategy.period_type,
+                                    count=instance.trading.bar_count,
+                                )
+                            except ApiError as error:
+                                if not error.is_transient_response:
+                                    raise
+                                await _pause_runtime_state(
+                                    state,
+                                    status="chart-unavailable",
+                                    message=str(error),
+                                    execute=execute,
+                                    now=loop.time(),
+                                )
+                                continue
+                            latest_bar_age = _latest_bar_age_seconds(bars)
+                            stale_threshold = _stale_threshold_seconds(
+                                instance.strategy.period_type,
+                                instance.trading.bar_stale_grace_seconds,
+                            )
+                            if _latest_is_stale_for_period(
+                                bars,
+                                instance.strategy.period_type,
+                                instance.trading.bar_stale_grace_seconds,
+                            ):
+                                freshness = (
+                                    "missing latest completed bar"
+                                    if latest_bar_age is None
+                                    else (
+                                        f"latest_age_seconds={latest_bar_age:.1f} "
+                                        f"threshold_seconds={stale_threshold:.1f}"
+                                    )
+                                )
+                                await _pause_runtime_state(
+                                    state,
+                                    status="stale-bars",
+                                    message=(
+                                        "Completed market data is stale or missing for "
+                                        f"{instance.name} ({freshness})."
+                                    ),
+                                    execute=execute,
+                                    now=loop.time(),
+                                )
+                                continue
+                            if len(bars) < required_completed_bars(instance.strategy):
+                                await _pause_runtime_state(
+                                    state,
+                                    status="insufficient-bars",
+                                    message=f"Not enough completed bars for {instance.name}.",
+                                    execute=execute,
+                                    now=loop.time(),
+                                )
+                                continue
+                            _recover_runtime_state(state, now=loop.time())
+                            if not state.history_loaded:
+                                assert state.event_log is not None
+                                state.event_log.write(
+                                    "HISTORY_LOADED",
+                                    count=len(bars),
+                                    period_type=instance.strategy.period_type,
+                                    first_time_ms=bars[0].time_ms,
+                                    latest_time_ms=bars[-1].time_ms,
+                                )
+                                _write_console_status(
+                                    f"Chart:{instance.name}",
+                                    f"Historical candles loaded count={len(bars)} "
+                                    f"period_type={instance.strategy.period_type} "
+                                    f"first_time_ms={bars[0].time_ms} "
+                                    f"latest_time_ms={bars[-1].time_ms}",
+                                )
+                                state.history_loaded = True
+                            if bars[-1].time_ms == state.last_bar_time:
+                                continue
+                            state.last_bar_time = bars[-1].time_ms
+                            evaluation = evaluate_latest_strategy(
+                                bars,
+                                strategy=instance.strategy,
+                                position_side=state.owned_side,
+                            )
+                            signal_name = (
+                                evaluation.event.signal.value
+                                if evaluation.event
+                                else Signal.NONE.value
+                            )
+                            position_name = state.owned_side.value if state.owned_side else "FLAT"
+                            _write_console_status(
+                                f"Strategy:{instance.name}",
+                                f"Indicators calculated candle_time_ms={bars[-1].time_ms} "
+                                f"close={bars[-1].close} "
+                                f"indicators={_indicator_summary(evaluation.indicators)} "
+                                f"signal={signal_name} position={position_name}",
+                            )
+                            assert state.event_log is not None
+                            state.event_log.write(
+                                "BAR_EVALUATED",
+                                bar_time_ms=bars[-1].time_ms,
+                                close=bars[-1].close,
+                                bid=state.last_quote.bid,
+                                ask=state.last_quote.ask,
+                                tag_present=bool(state.last_quote.tag),
+                                position=(state.owned_side.value if state.owned_side else None),
+                                indicators=evaluation.indicators,
+                            )
+                            event = evaluation.event
+                            if event is None:
+                                state.status = "waiting-signal"
+                                continue
+                            state.events.append(event)
+                            _write_console_status(
+                                f"Strategy:{instance.name}",
+                                f"Signal confirmed: {event.signal.value} "
+                                f"bid={state.last_quote.bid} ask={state.last_quote.ask}",
+                            )
+                            state.event_log.write(
+                                "SIGNAL",
+                                signal=event.signal.value,
+                                bar_time_ms=event.time_ms,
+                                close=event.close,
+                                indicators=evaluation.indicators,
+                            )
+                            if mode == "live-observe":
+                                state.status = "signal-observed"
+                                continue
+
+                            manager = state.manager
+                            if manager is None:
+                                raise RuntimeError("Execution manager was not initialized.")
+                            if event.signal in {Signal.OPEN_BUY, Signal.OPEN_SELL}:
+                                if state.owned_side is not None:
+                                    continue
+                                _write_instance_execution_summary(config, state, fingerprint, event)
+                                client_order_id = _client_order_id()
+                                side = "BUY" if event.signal is Signal.OPEN_BUY else "SELL"
+                                state.event_log.write(
+                                    "ORDER_SUBMITTED",
+                                    side=side,
+                                    amount=instance.trading.amount,
+                                    client_order_id=client_order_id,
+                                )
+                                _write_console_status(
+                                    f"REST:{instance.name}",
+                                    f"Submitting {side} {instance.trading.contract} "
+                                    f"amount={instance.trading.amount} "
+                                    f"client_order_id={client_order_id}",
+                                )
+                                try:
+                                    state.journal = await manager.open_position(
+                                        execute=execute,
+                                        account_fingerprint=fingerprint,
+                                        contract=instance.trading.contract,
+                                        amount=instance.trading.amount,
+                                        buy=event.signal is Signal.OPEN_BUY,
+                                        client_order_id=client_order_id,
+                                    )
+                                except ApiError as error:
+                                    if not error.is_definitive_rejection:
+                                        raise
+                                    state.status = "trade-rejected"
+                                    state.failure_reason = str(error)
+                                    state.completed = True
+                                    state.event_log.write(
+                                        "ORDER_REJECTED",
+                                        side=side,
+                                        amount=instance.trading.amount,
+                                        client_order_id=client_order_id,
+                                        status_code=error.status_code,
+                                        message=str(error),
+                                    )
+                                    _write_console_status(
+                                        f"REST:{instance.name}",
+                                        f"Order rejected; instance disabled: {error} "
+                                        "Other instances continue.",
+                                    )
+                                    continue
+                                state.owned_side = (
+                                    PositionSide.LONG
+                                    if event.signal is Signal.OPEN_BUY
+                                    else PositionSide.SHORT
+                                )
+                                state.event_log.write(
+                                    "POSITION_CONFIRMED",
+                                    deal_ref=state.journal.order_ref,
+                                    side=side,
+                                    amount=instance.trading.amount,
+                                )
+                                _write_console_status(
+                                    f"REST:{instance.name}",
+                                    f"Position confirmed deal_ref={state.journal.order_ref}",
+                                )
+                                state.status = "position-open"
+                            elif state.journal is not None:
+                                if not await _cleanup_or_schedule_retry(
+                                    state,
+                                    execute=execute,
+                                    now=loop.time(),
+                                ):
+                                    continue
+                                state.status = "waiting-signal"
+                                state.event_log.write("ROUND_TRIP_COMPLETED")
+                                _write_console_status(
+                                    f"Strategy:{instance.name}",
+                                    "Round trip complete; waiting for the next signal.",
+                                )
+
+                        heartbeat.write({state.config.name: state.status for state in states})
+                        active_polls = [
+                            state.config.trading.poll_seconds
+                            for state in states
+                            if not state.completed
+                        ]
+                        if active_polls:
+                            await asyncio.sleep(min(active_polls))
+                finally:
+                    primary_error = sys.exception()
+                    for state in states:
+                        if state.journal is not None:
+                            try:
+                                await _cleanup_runtime_state(state, execute=execute)
+                                state.status = "cleaned-up"
+                            except Exception as cleanup_error:
+                                if primary_error is None:
+                                    raise
+                                state.status = "cleanup-deferred"
+                                if state.event_log is not None:
+                                    state.event_log.write(
+                                        "CLEANUP_DEFERRED",
+                                        deal_ref=state.journal.order_ref,
+                                        error_type=type(cleanup_error).__name__,
+                                        message=str(cleanup_error),
+                                    )
+                                _write_console_status(
+                                    f"REST:{state.config.name}",
+                                    f"Shutdown cleanup deferred: {cleanup_error} "
+                                    "The ownership journal was retained.",
+                                )
+                    heartbeat.write({state.config.name: state.status for state in states})
+    except Exception as error:
+        _write_console_status("Runner", f"Stopped by {type(error).__name__}: {error}")
+        for state in states:
+            if state.event_log is not None:
+                state.event_log.write(
+                    "ERROR",
+                    status=state.status,
+                    error_type=type(error).__name__,
+                    message=str(error),
+                )
+        raise
+    finally:
+        for state in states:
+            if state.event_log is not None:
+                state.event_log.write("STOPPED", status=state.status)
+                state.event_log.close()
+            _write_console_status(f"Strategy:{state.config.name}", f"Stopped status={state.status}")
+
+    failed_instances = [state.config.name for state in states if state.failure_reason is not None]
+    has_events = any(state.events for state in states)
+    outcome = (
+        Outcome.INCONCLUSIVE
+        if failed_instances
+        else (Outcome.SUCCESS if has_events else Outcome.NO_SIGNAL)
+    )
+    return CommandResult(
+        "algo-runner",
+        outcome,
+        (
+            "Algo runner completed with one or more disabled instances."
+            if failed_instances
+            else "Algo runner stopped at its configured runtime limit."
+        ),
+        {
+            "mode": mode,
+            "account_fingerprint": fingerprint,
+            "shared_price_session": True,
+            "failed_instances": failed_instances,
+            "instances": {state.config.name: _runtime_data(state) for state in states},
+        },
+    )
+
+
 async def recover(config: AppConfig, execute: bool) -> CommandResult:
-    path = _journal_path(config)
-    if not path.exists():
+    candidate_paths = [_journal_path(config)] + [
+        instance_journal_path(instance.name, instance.trading.contract)
+        for instance in config.algo_instances
+    ]
+    paths = list(dict.fromkeys(path for path in candidate_paths if path.exists()))
+    if not paths:
         return CommandResult(
             "recover", Outcome.SUCCESS, "No unresolved execution journal exists.", {}
         )
-    journal = Journal.load(path)
     fingerprint = account_fingerprint(config.secrets.api_key)
-    if journal.account_fingerprint != fingerprint:
-        raise LiveExecutionBlocked("Recovery journal belongs to a different account fingerprint.")
-    if not journal.order_ref:
-        journal.with_state(JournalState.OWNERSHIP_UNCONFIRMED)
-        return CommandResult(
-            "recover",
-            Outcome.BLOCKED,
-            "Submission may have been accepted, but ownership cannot be confirmed automatically.",
-            {
-                "state": JournalState.OWNERSHIP_UNCONFIRMED.value,
-                "client_order_id": journal.client_order_id,
-            },
-        )
+    results: list[dict[str, Any]] = []
+    blocked = False
     async with make_client(config) as client:
-        position = await client.get_position_detail(journal.order_ref)
-        if position is None:
-            journal.clear()
-            return CommandResult(
-                "recover",
-                Outcome.SUCCESS,
-                "Tracked position is already closed; journal cleared.",
-                {},
+        manager_by_path: dict[Path, ExecutionManager] = {}
+        for path in paths:
+            journal = Journal.load(path)
+            if journal.account_fingerprint != fingerprint:
+                raise LiveExecutionBlocked(
+                    "Recovery journal belongs to a different account fingerprint."
+                )
+            if not journal.order_ref:
+                manager = manager_by_path.setdefault(
+                    path,
+                    ExecutionManager(
+                        client=client,
+                        journal_path=path,
+                        live_trading_enabled=config.live_trading_enabled,
+                        poll_seconds=config.trading.market_data_retry_seconds,
+                    ),
+                )
+                reconciled = await manager.reconcile_submission(journal=journal)
+                if reconciled is None:
+                    journal.with_state(JournalState.OWNERSHIP_UNCONFIRMED)
+                    blocked = True
+                    results.append(
+                        {
+                            "journal": str(path),
+                            "state": JournalState.OWNERSHIP_UNCONFIRMED.value,
+                            "client_order_id": journal.client_order_id,
+                        }
+                    )
+                    continue
+                journal = reconciled
+            if journal.order_ref is None:
+                raise LiveExecutionBlocked(
+                    f"Execution journal for {path} has no position reference after reconciliation."
+                )
+            position = await client.get_position_detail(journal.order_ref)
+            if position is None:
+                journal.clear()
+                results.append({"journal": str(path), "state": "already-closed"})
+                continue
+            if not execute:
+                blocked = True
+                results.append(
+                    {
+                        "journal": str(path),
+                        "state": "open",
+                        "order_ref": journal.order_ref,
+                    }
+                )
+                continue
+            manager = manager_by_path.setdefault(
+                path,
+                ExecutionManager(
+                    client=client,
+                    journal_path=path,
+                    live_trading_enabled=config.live_trading_enabled,
+                ),
             )
-        if not execute:
-            return CommandResult(
-                "recover",
-                Outcome.BLOCKED,
-                "Tracked position remains open; rerun recovery with both execution gates.",
-                {"order_ref": journal.order_ref},
+            cleanup_ref = await manager.cleanup(
+                journal=journal, execute=True, client_order_id=_client_order_id()
             )
-        manager = ExecutionManager(
-            client=client,
-            journal_path=path,
-            live_trading_enabled=config.live_trading_enabled,
-        )
-        cleanup_ref = await manager.cleanup(
-            journal=journal, execute=True, client_order_id=_client_order_id()
-        )
+            results.append(
+                {"journal": str(path), "state": "cleaned-up", "cleanup_ref": cleanup_ref}
+            )
     return CommandResult(
         "recover",
-        Outcome.SUCCESS,
-        "Tracked position was cleaned up and confirmed closed.",
-        {"cleanup_ref": cleanup_ref},
+        Outcome.BLOCKED if blocked else Outcome.SUCCESS,
+        (
+            "One or more journals require inspection or both execution gates."
+            if blocked
+            else "Tracked positions were reconciled."
+        ),
+        {"journals": results},
     )

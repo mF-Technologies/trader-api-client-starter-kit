@@ -40,6 +40,7 @@ trader-api-examples contract-calculator --config config.local.yaml --lots 0.01
 trader-api-examples market-data-monitor --config config.local.yaml
 trader-api-examples order-lifecycle-checker --config config.local.yaml
 trader-api-examples rsi-algo-demo --config config.local.yaml --mode replay
+trader-api-examples algo-runner --config config.local.yaml
 ```
 
 Every command supports `--output human` (default) or `--output json`. Logs go to stderr;
@@ -48,7 +49,61 @@ the result goes to stdout.
 `market-data-monitor` reads both the current quote and completed historical bars. Use
 `--bars-only` when validating Chart Server without opening a price session.
 
-## RSI Algo Demo
+## Algo Runner
+
+`algo-runner` is the supported long-running example for customers moving from the earlier
+algo sample. It keeps one FxServer/Price Agent WebSocket session open for all configured
+instances, uses Realtime Chart Server completed bars for signals, and sends every trading
+mutation through FxServer REST.
+
+RSI is the v1 live-verified strategy. The package also contains `macd` and `ema_cross`
+reference implementations with offline tests, but they are not part of the v1 live-support
+claim. Add an `instances` list to `config.local.yaml` to run RSI against different contracts
+through the shared price session. Each instance has its own position state and recovery
+journal. When `instances` is omitted, the shared `trading` and `strategy` sections define
+one `default` instance.
+
+The default `live-observe` mode streams account-specific quotes and evaluates signals but
+does not trade:
+
+```powershell
+trader-api-examples algo-runner --config config.local.yaml
+```
+
+The runner evaluates each completed bar once and writes `runtime/algo-heartbeat.json` for
+external health monitoring. By default it runs until interrupted; set
+`max_runtime_seconds` to a positive value only when a bounded QA run is required. `bar_count`
+controls the completed-candle history used for indicator warm-up, while `poll_seconds` controls
+how often the runner checks quotes and completed bars. Stale quotes, stale bars, or insufficient
+historical bars pause only the affected instance and block new entries while healthy instances
+continue. A completed bar is considered stale only after two bar periods plus
+`bar_stale_grace_seconds`; this allows a short publication delay without trading on an old bar.
+The paused instance retries market data every `market_data_retry_seconds` and
+automatically resumes after valid data returns. If it owns a position and data remains unavailable for
+`stale_position_grace_seconds`, the runner closes that position through REST and continues
+retrying market data. Temporary `934` liquidation failures retain the ownership journal and
+retry only the affected instance. Transient ChartServer and chart-code HTTP failures (`408`,
+`425`, `429`, and `5xx`) follow the same per-instance retry path; chart-code mappings are
+cached for the worker lifetime. Transient `positionDetail` failures during startup retain the
+ownership journal and keep that instance in position recovery until the position is confirmed;
+it cannot submit new trades while recovery is pending. Invalid contract amounts and unresolved
+ownership journals stop the worker without automatic restart.
+
+Each instance also writes a structured event stream to `runtime/logs/<instance>.jsonl`.
+It records bar evaluations and indicator values, signals, order and liquidation attempts,
+confirmed positions, errors, and shutdown status. Records are flushed immediately and the
+files rotate at 10 MB with five backups. Credentials, tokens, and full price tags are never
+included. These diagnostic logs are separate from the temporary ownership journals used
+for recovery.
+
+With `fxserverclientpython` 0.1.10, the WebSocket client is process-scoped. The default
+`algo-runner` command therefore supervises a child worker. When the shared FxServer or Price
+Agent transport becomes unhealthy, the worker exits, retains any unresolved ownership
+journals, and is restarted after `market_data_retry_seconds`. The new worker creates a fresh
+WebSocket session and reconciles each journal before strategy evaluation resumes. It does not
+call the package's unstable logout path or reconnect inside the failed process.
+
+## RSI Replay Demo
 
 The demo uses TA-Lib RSI(14) over completed Realtime Chart Server bars:
 
@@ -58,11 +113,13 @@ The demo uses TA-Lib RSI(14) over completed Realtime Chart Server bars:
 - Hold at most one owned position and complete at most one round trip per run.
 - Do not average, martingale, repeat while inside a zone, or relax thresholds to create a signal.
 
-Modes:
+Modes retained by this focused RSI command:
 
 - `replay`: synthetic fixture, no network, no trading; this is the default.
 - `live-observe`: live completed bars and proposed actions, no trading.
 - `live-execute`: live bars plus real Trader API mutations.
+
+Use `algo-runner` for the shared Price Agent session and multi-strategy workflow.
 
 `NO_SIGNAL` is a normal result. Missing, malformed, stale, or interrupted market data is
 `INCONCLUSIVE` instead.
@@ -77,24 +134,38 @@ Both gates are required before any mutation:
 
 ```powershell
 $env:TRADER_API_ENABLE_LIVE_TRADING = "true"
-trader-api-examples rsi-algo-demo --config config.local.yaml --mode live-execute --execute
+trader-api-examples algo-runner --config config.local.yaml --mode live-execute --execute
 ```
 
 Before submitting, the tool displays a redacted account fingerprint, environment,
 contract, side, and amount. It persists a minimal ignored recovery journal before sending
 `addDeal`. The tool only closes positions whose ownership it can establish. Unrelated
 positions produce a warning; unresolved or ambiguous ownership blocks new submissions.
+On restart, `algo-runner` restores a confirmed open position from its per-instance journal.
+If shutdown was interrupted during cleanup, it retries that cleanup with the persisted
+intent before resuming the strategy. Temporary `710` or `934` cleanup rejections keep only
+that instance in `cleanup-pending`; the position remains tracked and cleanup is retried while
+other instances continue. A `409 DUPLICATE_CLIENT_ORDER_ID` during cleanup is reconciled by
+checking whether the owned position has disappeared; the runner retains the same client order
+id and never submits a new liquidation request for that ambiguous attempt. It never adopts an
+account position without a matching ownership journal.
 
 The current API prevents duplicate requests with `clientOrderId`, but the current query
 contracts do not expose a reliable `clientOrderId` correlation. When a submission outcome
-is ambiguous, the tool fails closed and requires inspection in Trader Terminal.
+is ambiguous, the tool reconciles read-only order and position state using the client order
+id when available, otherwise an exact contract/side/amount match that excludes positions
+seen before submission. It adopts a reference only when the match is unique and the
+position detail is confirmed; ambiguous ownership retains the journal and blocks that
+instance until it can be reconciled.
 
 ## Scope
 
-The v1 tools cover WebProxy token exchange/account state, FxServer Trader REST execution,
-Realtime Chart Server completed bars, contract amount calculation, and an RSI reference
-flow. They do not cover Terminal UI automation, CRM, payments, PAMM, MT5, deployment,
-multi-instance bot orchestration, a strategy marketplace, or production operations.
+The examples cover WebProxy token exchange/account state, a shared account-specific price
+session, FxServer Trader REST execution, Realtime Chart Server completed bars, contract
+amount calculation, RSI/MACD/EMA Cross signals, multi-instance orchestration, heartbeat,
+and owned-position recovery. They do not cover Terminal UI automation, CRM, payments,
+PAMM, MT5, service installation, process auto-restart, a strategy marketplace, or
+production operations.
 
 See [SUPPORT.md](SUPPORT.md) for issue routing and [SECURITY.md](SECURITY.md) before sharing
 diagnostics.

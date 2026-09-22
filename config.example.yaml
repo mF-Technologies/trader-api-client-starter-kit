@@ -8,15 +8,51 @@ endpoints:
   price_agent_ws_url: wss://price-agent.example/websocket
 
 trading:
-  contract: EURUSD
-  amount: 1000
-  max_runtime_seconds: 600
+  # Shared runtime defaults inherited by every instance.
+  # null keeps the algo running until interrupted; set a positive value for bounded QA runs.
+  max_runtime_seconds: null
+  # Refresh quotes and completed bars every five seconds. Each completed bar is evaluated once.
   poll_seconds: 5
+  # Completed candles fetched for indicator warm-up and calculation.
   bar_count: 200
+  # Print a price heartbeat per symbol without logging every poll or tick.
+  price_log_interval_seconds: 30
+  # Retry paused symbols and restart a failed WebSocket worker after this delay.
+  market_data_retry_seconds: 30
+  # Allow delayed publication of one completed candle before pausing the instance.
+  bar_stale_grace_seconds: 60
+  stale_position_grace_seconds: 120
 
 strategy:
+  name: rsi
   period_type: 1
   rsi_period: 14
   oversold: 30
   overbought: 70
   exit_level: 50
+  fast_period: 12
+  slow_period: 26
+  signal_period: 9
+
+# Each instance shares one price session but owns separate strategy state, logs, and a
+# REST execution journal. Every contract must exist in the account's contract settings
+# and have a valid FxServer chartCode mapping.
+instances:
+  - name: gold-rsi
+    trading:
+      contract: LLG
+      amount: 10
+    strategy:
+      name: rsi
+  - name: euro-rsi
+    trading:
+      contract: EURUSD
+      amount: 1000
+    strategy:
+      name: rsi
+  - name: sterling-rsi
+    trading:
+      contract: GBPUSD
+      amount: 1000
+    strategy:
+      name: rsi

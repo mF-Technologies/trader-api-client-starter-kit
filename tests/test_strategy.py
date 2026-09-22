@@ -1,4 +1,9 @@
-from trader_api_examples.strategy import PositionSide, Signal, signal_from_rsi_crossing
+from trader_api_examples.strategy import (
+    PositionSide,
+    Signal,
+    signal_from_line_crossing,
+    signal_from_rsi_crossing,
+)
 
 
 def test_rsi_crossing_up_out_of_oversold_opens_buy() -> None:
@@ -17,3 +22,10 @@ def test_remaining_inside_threshold_does_not_repeat_signal() -> None:
 def test_position_exits_only_when_rsi_crosses_neutral() -> None:
     assert signal_from_rsi_crossing(49.0, 51.0, PositionSide.LONG) is Signal.CLOSE_BUY
     assert signal_from_rsi_crossing(51.0, 49.0, PositionSide.SHORT) is Signal.CLOSE_SELL
+
+
+def test_line_crossing_opens_and_closes_owned_positions() -> None:
+    assert signal_from_line_crossing(-1, 1, None) is Signal.OPEN_BUY
+    assert signal_from_line_crossing(1, -1, None) is Signal.OPEN_SELL
+    assert signal_from_line_crossing(1, -1, PositionSide.LONG) is Signal.CLOSE_BUY
+    assert signal_from_line_crossing(-1, 1, PositionSide.SHORT) is Signal.CLOSE_SELL
