@@ -38,6 +38,8 @@ class Journal:
     client_order_id: int
     state: JournalState
     updated_at: str
+    submitted_at: str = ""
+    preexisting_position_refs: tuple[str, ...] = ()
     order_ref: str | None = None
     cleanup_ref: str | None = None
     cleanup_client_order_id: int | None = None
@@ -53,8 +55,10 @@ class Journal:
         side: str,
         amount: float,
         client_order_id: int,
+        preexisting_position_refs: tuple[str, ...] = (),
     ) -> Journal:
         cls.assert_clear(path)
+        submitted_at = datetime.now(UTC).isoformat()
         journal = cls(
             path=path,
             run_id=run_id,
@@ -64,7 +68,9 @@ class Journal:
             amount=amount,
             client_order_id=client_order_id,
             state=JournalState.PENDING_SUBMISSION,
-            updated_at=datetime.now(UTC).isoformat(),
+            updated_at=submitted_at,
+            submitted_at=submitted_at,
+            preexisting_position_refs=preexisting_position_refs,
         )
         journal.save()
         return journal
@@ -82,6 +88,12 @@ class Journal:
             client_order_id=int(data["client_order_id"]),
             state=JournalState(data["state"]),
             updated_at=str(data["updated_at"]),
+            submitted_at=str(data.get("submitted_at") or data["updated_at"]),
+            preexisting_position_refs=tuple(
+                str(ref)
+                for ref in data.get("preexisting_position_refs", [])
+                if ref is not None and str(ref)
+            ),
             order_ref=str(data["order_ref"]) if data.get("order_ref") else None,
             cleanup_ref=str(data["cleanup_ref"]) if data.get("cleanup_ref") else None,
             cleanup_client_order_id=(

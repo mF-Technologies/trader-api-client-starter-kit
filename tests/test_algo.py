@@ -1,5 +1,12 @@
-from trader_api_examples.algo import Outcome, evaluate_replay, latest_signal
+from trader_api_examples.algo import (
+    Outcome,
+    evaluate_latest_strategy,
+    evaluate_replay,
+    latest_signal,
+    latest_strategy_signal,
+)
 from trader_api_examples.api import Bar
+from trader_api_examples.config import StrategyConfig
 from trader_api_examples.strategy import PositionSide, Signal
 
 
@@ -42,3 +49,52 @@ def test_latest_signal_uses_latest_crossing_and_owned_position_state() -> None:
     )
     assert close_event is not None
     assert close_event.signal is Signal.CLOSE_BUY
+
+
+def test_latest_strategy_signal_supports_ema_cross() -> None:
+    bars = bars_from_closes([10, 10, 10, 10, 10, 10, 10, 10, 1, 20])
+
+    event = latest_strategy_signal(
+        bars,
+        strategy=StrategyConfig(name="ema_cross", fast_period=2, slow_period=4),
+        position_side=None,
+    )
+
+    assert event is not None
+    assert event.signal is Signal.OPEN_BUY
+    assert event.strategy == "ema_cross"
+
+
+def test_latest_strategy_signal_supports_macd() -> None:
+    bars = bars_from_closes([10, 10, 10, 10, 10, 10, 10, 10, 1, 20])
+
+    event = latest_strategy_signal(
+        bars,
+        strategy=StrategyConfig(name="macd", fast_period=2, slow_period=4, signal_period=2),
+        position_side=None,
+    )
+
+    assert event is not None
+    assert event.signal is Signal.OPEN_BUY
+    assert event.strategy == "macd"
+
+
+def test_latest_strategy_signal_returns_none_when_history_is_incomplete() -> None:
+    event = latest_strategy_signal(
+        bars_from_closes([1, 2, 3]),
+        strategy=StrategyConfig(name="ema_cross", fast_period=2, slow_period=4),
+        position_side=None,
+    )
+
+    assert event is None
+
+
+def test_strategy_evaluation_exposes_indicator_values_without_a_signal() -> None:
+    evaluation = evaluate_latest_strategy(
+        bars_from_closes([100 + index * 0.01 for index in range(40)]),
+        strategy=StrategyConfig(),
+        position_side=None,
+    )
+
+    assert evaluation.event is None
+    assert "rsi" in evaluation.indicators

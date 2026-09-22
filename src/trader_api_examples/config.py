@@ -37,18 +37,33 @@ class EndpointsConfig:
 class TradingConfig:
     contract: str = "EURUSD"
     amount: float = 1000.0
-    max_runtime_seconds: int = 600
+    max_runtime_seconds: float | None = None
     poll_seconds: float = 5.0
     bar_count: int = 200
+    price_log_interval_seconds: float = 30.0
+    market_data_retry_seconds: float = 30.0
+    bar_stale_grace_seconds: float = 60.0
+    stale_position_grace_seconds: float = 120.0
 
 
 @dataclass(frozen=True)
 class StrategyConfig:
+    name: str = "rsi"
     period_type: int = 1
     rsi_period: int = 14
     oversold: float = 30.0
     overbought: float = 70.0
     exit_level: float = 50.0
+    fast_period: int = 12
+    slow_period: int = 26
+    signal_period: int = 9
+
+
+@dataclass(frozen=True)
+class AlgoInstanceConfig:
+    name: str
+    trading: TradingConfig
+    strategy: StrategyConfig
 
 
 @dataclass(frozen=True)
@@ -64,8 +79,15 @@ class AppConfig:
     endpoints: EndpointsConfig = field(default_factory=EndpointsConfig)
     trading: TradingConfig = field(default_factory=TradingConfig)
     strategy: StrategyConfig = field(default_factory=StrategyConfig)
+    instances: tuple[AlgoInstanceConfig, ...] = ()
     secrets: Secrets = field(default_factory=lambda: Secrets(api_key=""))
     live_trading_enabled: bool = False
+
+    @property
+    def algo_instances(self) -> tuple[AlgoInstanceConfig, ...]:
+        if self.instances:
+            return self.instances
+        return (AlgoInstanceConfig("default", self.trading, self.strategy),)
 
 
 def _reject_sensitive_fields(value: Any, path: str = "config") -> None:
@@ -112,16 +134,38 @@ def load_config(path: Path, *, require_api_key: bool = True) -> AppConfig:
     endpoints = _mapping(data.get("endpoints"), "endpoints")
     trading = _mapping(data.get("trading"), "trading")
     strategy = _mapping(data.get("strategy"), "strategy")
+    raw_instances = data.get("instances", [])
+    if not isinstance(raw_instances, list):
+        raise ConfigError("instances must be a list.")
 
     environment = str(data.get("environment", "")).strip().lower()
     if environment not in {"demo", "live"}:
         raise ConfigError("environment must be 'demo' or 'live'.")
 
+    default_trading = TradingConfig(**trading)
+    default_strategy = StrategyConfig(**strategy)
+    instances: list[AlgoInstanceConfig] = []
+    for index, raw_instance in enumerate(raw_instances):
+        instance = _mapping(raw_instance, f"instances[{index}]")
+        name = str(instance.get("name", "")).strip()
+        if not name:
+            raise ConfigError(f"instances[{index}].name must not be empty.")
+        trading_overrides = _mapping(instance.get("trading"), f"instances[{index}].trading")
+        strategy_overrides = _mapping(instance.get("strategy"), f"instances[{index}].strategy")
+        instances.append(
+            AlgoInstanceConfig(
+                name=name,
+                trading=TradingConfig(**({**vars(default_trading), **trading_overrides})),
+                strategy=StrategyConfig(**({**vars(default_strategy), **strategy_overrides})),
+            )
+        )
+
     result = AppConfig(
         environment=environment,
         endpoints=EndpointsConfig(**endpoints),
-        trading=TradingConfig(**trading),
-        strategy=StrategyConfig(**strategy),
+        trading=default_trading,
+        strategy=default_strategy,
+        instances=tuple(instances),
         secrets=Secrets(
             api_key=api_key,
             username=_environment_value(local_environment, "TRADER_API_USERNAME"),
@@ -137,13 +181,56 @@ def load_config(path: Path, *, require_api_key: bool = True) -> AppConfig:
 
 
 def _validate_config(config: AppConfig) -> None:
-    if config.trading.amount <= 0:
-        raise ConfigError("trading.amount must be greater than zero.")
-    if config.trading.max_runtime_seconds <= 0:
-        raise ConfigError("trading.max_runtime_seconds must be greater than zero.")
-    if config.trading.bar_count < config.strategy.rsi_period + 2:
-        raise ConfigError("trading.bar_count must provide enough completed bars for RSI.")
-    if not 0 < config.strategy.oversold < config.strategy.exit_level:
-        raise ConfigError("strategy.oversold must be below strategy.exit_level.")
-    if not config.strategy.exit_level < config.strategy.overbought < 100:
-        raise ConfigError("strategy.overbought must be above strategy.exit_level.")
+    names = [instance.name for instance in config.algo_instances]
+    if len(names) != len(set(names)):
+        raise ConfigError("instances.name values must be unique.")
+    for instance in config.algo_instances:
+        trading = instance.trading
+        strategy = instance.strategy
+        prefix = f"instances[{instance.name}]"
+        if not trading.contract.strip():
+            raise ConfigError(f"{prefix}.trading.contract must not be empty.")
+        if trading.amount <= 0:
+            raise ConfigError(f"{prefix}.trading.amount must be greater than zero.")
+        if trading.max_runtime_seconds is not None and trading.max_runtime_seconds <= 0:
+            raise ConfigError(f"{prefix}.trading.max_runtime_seconds must be greater than zero.")
+        if trading.poll_seconds <= 0:
+            raise ConfigError(f"{prefix}.trading.poll_seconds must be greater than zero.")
+        if trading.market_data_retry_seconds <= 0:
+            raise ConfigError(
+                f"{prefix}.trading.market_data_retry_seconds must be greater than zero."
+            )
+        if trading.bar_stale_grace_seconds <= 0:
+            raise ConfigError(
+                f"{prefix}.trading.bar_stale_grace_seconds must be greater than zero."
+            )
+        if trading.price_log_interval_seconds <= 0:
+            raise ConfigError(
+                f"{prefix}.trading.price_log_interval_seconds must be greater than zero."
+            )
+        if trading.stale_position_grace_seconds <= 0:
+            raise ConfigError(
+                f"{prefix}.trading.stale_position_grace_seconds must be greater than zero."
+            )
+        if strategy.name not in {"rsi", "macd", "ema_cross"}:
+            raise ConfigError(f"{prefix}.strategy.name is not supported: {strategy.name}")
+        if strategy.period_type not in range(1, 21):
+            raise ConfigError(f"{prefix}.strategy.period_type is not supported.")
+        if strategy.name == "rsi":
+            required_bars = strategy.rsi_period + 2
+        elif strategy.name == "ema_cross":
+            required_bars = strategy.slow_period + 2
+        else:
+            required_bars = strategy.slow_period + strategy.signal_period + 2
+        if trading.bar_count < required_bars:
+            raise ConfigError(f"{prefix}.trading.bar_count is too small for the strategy.")
+        if strategy.name in {"macd", "ema_cross"} and (
+            strategy.fast_period <= 0 or strategy.slow_period <= strategy.fast_period
+        ):
+            raise ConfigError(f"{prefix}.strategy periods require 0 < fast_period < slow_period.")
+        if strategy.name == "macd" and strategy.signal_period <= 0:
+            raise ConfigError(f"{prefix}.strategy.signal_period must be greater than zero.")
+        if strategy.name == "rsi" and not 0 < strategy.oversold < strategy.exit_level:
+            raise ConfigError(f"{prefix}.strategy.oversold must be below exit_level.")
+        if strategy.name == "rsi" and not strategy.exit_level < strategy.overbought < 100:
+            raise ConfigError(f"{prefix}.strategy.overbought must be above exit_level.")

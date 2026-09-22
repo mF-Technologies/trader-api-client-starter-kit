@@ -3,6 +3,7 @@ from pathlib import Path
 
 import pytest
 
+from trader_api_examples.api import ApiError
 from trader_api_examples.cli import build_parser, main
 
 
@@ -14,6 +15,7 @@ from trader_api_examples.cli import build_parser, main
         "market-data-monitor",
         "order-lifecycle-checker",
         "rsi-algo-demo",
+        "algo-runner",
         "recover",
     ],
 )
@@ -22,6 +24,60 @@ def test_cli_exposes_expected_commands(command: str) -> None:
     args = parser.parse_args([command, "--config", "config.local.yaml"])
 
     assert args.command == command
+
+
+def test_algo_runner_defaults_to_observe_mode() -> None:
+    args = build_parser().parse_args(["algo-runner", "--config", "config.local.yaml"])
+
+    assert args.mode == "live-observe"
+    assert args.execute is False
+
+
+def test_algo_runner_uses_process_supervisor_by_default(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = tmp_path / "config.yaml"
+    config.write_text("environment: demo\n", encoding="utf-8")
+    monkeypatch.setenv("TRADER_API_KEY", "api-key")
+    commands: list[list[str]] = []
+
+    monkeypatch.setattr(
+        "trader_api_examples.cli.run_supervisor",
+        lambda command, **_kwargs: commands.append(list(command)) or 17,
+    )
+
+    exit_code = main(["algo-runner", "--config", str(config)])
+
+    assert exit_code == 17
+    assert commands[0][-1] == "--worker"
+
+
+@pytest.mark.parametrize(
+    ("status_code", "expected_exit_code", "expected_outcome"),
+    [(502, 2, "[ERROR]"), (401, 4, "[BLOCKED]")],
+)
+def test_cli_classifies_transient_api_failures_for_supervisor_restart(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    status_code: int,
+    expected_exit_code: int,
+    expected_outcome: str,
+) -> None:
+    config = tmp_path / "config.yaml"
+    config.write_text("environment: demo\n", encoding="utf-8")
+    monkeypatch.setenv("TRADER_API_KEY", "api-key")
+
+    def raise_api_error(*_: object) -> None:
+        raise ApiError("token exchange returned an upstream error.", status_code)
+
+    monkeypatch.setattr("trader_api_examples.cli._run_command", raise_api_error)
+
+    exit_code = main(["account-inspector", "--config", str(config)])
+
+    assert exit_code == expected_exit_code
+    assert capsys.readouterr().out.startswith(expected_outcome)
 
 
 def test_replay_runs_without_api_key_and_writes_json(
