@@ -8,6 +8,8 @@ from typing import Any
 import yaml
 from dotenv import dotenv_values
 
+from .strategies.registry import available_strategy_names, get_strategy
+
 
 class ConfigError(ValueError):
     """Raised when local configuration is missing or unsafe."""
@@ -212,19 +214,14 @@ def _validate_config(config: AppConfig) -> None:
             raise ConfigError(
                 f"{prefix}.trading.stale_position_grace_seconds must be greater than zero."
             )
-        if strategy.name not in {"rsi", "macd", "ema_cross"}:
+        if strategy.name not in available_strategy_names():
             raise ConfigError(f"{prefix}.strategy.name is not supported: {strategy.name}")
         if strategy.period_type not in range(1, 21):
             raise ConfigError(f"{prefix}.strategy.period_type is not supported.")
-        if strategy.name == "rsi":
-            required_bars = strategy.rsi_period + 2
-        elif strategy.name == "ema_cross":
-            required_bars = strategy.slow_period + 2
-        else:
-            required_bars = strategy.slow_period + strategy.signal_period + 2
+        required_bars = get_strategy(strategy.name).required_completed_bars(strategy)
         if trading.bar_count < required_bars:
             raise ConfigError(f"{prefix}.trading.bar_count is too small for the strategy.")
-        if strategy.name in {"macd", "ema_cross"} and (
+        if strategy.name in {"macd", "ema_cross", "sma_cross"} and (
             strategy.fast_period <= 0 or strategy.slow_period <= strategy.fast_period
         ):
             raise ConfigError(f"{prefix}.strategy periods require 0 < fast_period < slow_period.")

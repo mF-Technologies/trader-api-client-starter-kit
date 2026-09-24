@@ -79,6 +79,20 @@ def test_latest_strategy_signal_supports_macd() -> None:
     assert event.strategy == "macd"
 
 
+def test_latest_strategy_signal_supports_sma_cross() -> None:
+    bars = bars_from_closes([10, 10, 10, 10, 10, 10, 1, 20])
+
+    event = latest_strategy_signal(
+        bars,
+        strategy=StrategyConfig(name="sma_cross", fast_period=2, slow_period=4),
+        position_side=None,
+    )
+
+    assert event is not None
+    assert event.signal is Signal.OPEN_BUY
+    assert event.strategy == "sma_cross"
+
+
 def test_latest_strategy_signal_returns_none_when_history_is_incomplete() -> None:
     event = latest_strategy_signal(
         bars_from_closes([1, 2, 3]),

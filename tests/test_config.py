@@ -147,6 +147,13 @@ instances:
       name: ema_cross
       fast_period: 10
       slow_period: 30
+  - name: silver-sma
+    trading:
+      contract: LLS
+    strategy:
+      name: sma_cross
+      fast_period: 10
+      slow_period: 30
 """.strip(),
         encoding="utf-8",
     )
@@ -154,11 +161,16 @@ instances:
 
     config = load_config(config_path)
 
-    assert [instance.name for instance in config.algo_instances] == ["gold-rsi", "euro-ema"]
+    assert [instance.name for instance in config.algo_instances] == [
+        "gold-rsi",
+        "euro-ema",
+        "silver-sma",
+    ]
     assert config.algo_instances[0].trading.amount == 1000
     assert config.algo_instances[0].trading.max_runtime_seconds == 900
     assert config.algo_instances[1].trading.amount == 2000
     assert config.algo_instances[1].strategy.fast_period == 10
+    assert config.algo_instances[2].strategy.name == "sma_cross"
 
 
 def test_load_config_rejects_duplicate_instance_names(
