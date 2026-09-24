@@ -56,12 +56,32 @@ algo sample. It keeps one FxServer/Price Agent WebSocket session open for all co
 instances, uses Realtime Chart Server completed bars for signals, and sends every trading
 mutation through FxServer REST.
 
-RSI is the v1 live-verified strategy. The package also contains `macd` and `ema_cross`
-reference implementations with offline tests, but they are not part of the v1 live-support
-claim. Add an `instances` list to `config.local.yaml` to run RSI against different contracts
+The built-in strategy modules are independently registered as `rsi`, `ema_cross`,
+`sma_cross`, and `macd`. Each instance selects one strategy by name, so strategy logic can be
+tested, replaced, or packaged without changing the shared market-data and REST execution
+runner. RSI is the v1 live-verified strategy. The moving-average and MACD modules have
+offline tests but are reference implementations until they complete separate live validation.
+The registry is an extension boundary for future strategy packages; it is not an external
+marketplace or third-party loader yet.
+
+Add an `instances` list to `config.local.yaml` to run strategies against different contracts
 through the shared price session. Each instance has its own position state and recovery
 journal. When `instances` is omitted, the shared `trading` and `strategy` sections define
 one `default` instance.
+
+For example, an instance can choose a moving-average strategy without changing the runner:
+
+```yaml
+instances:
+  - name: euro-ema
+    trading:
+      contract: EURUSD
+      amount: 1000
+    strategy:
+      name: ema_cross
+      fast_period: 12
+      slow_period: 26
+```
 
 The default `live-observe` mode streams account-specific quotes and evaluates signals but
 does not trade:
