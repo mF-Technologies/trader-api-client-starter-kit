@@ -15,6 +15,9 @@ class ConfigError(ValueError):
     """Raised when local configuration is missing or unsafe."""
 
 
+MIN_POSITION_RECONCILE_SECONDS = 1.0
+
+
 SENSITIVE_KEYS = {
     "api_key",
     "password",
@@ -43,6 +46,7 @@ class TradingConfig:
     poll_seconds: float = 5.0
     bar_count: int = 200
     price_log_interval_seconds: float = 30.0
+    position_reconcile_seconds: float = 5.0
     market_data_retry_seconds: float = 30.0
     bar_stale_grace_seconds: float = 60.0
     stale_position_grace_seconds: float = 120.0
@@ -209,6 +213,11 @@ def _validate_config(config: AppConfig) -> None:
         if trading.price_log_interval_seconds <= 0:
             raise ConfigError(
                 f"{prefix}.trading.price_log_interval_seconds must be greater than zero."
+            )
+        if trading.position_reconcile_seconds < MIN_POSITION_RECONCILE_SECONDS:
+            raise ConfigError(
+                f"{prefix}.trading.position_reconcile_seconds must be at least "
+                f"{MIN_POSITION_RECONCILE_SECONDS:g} second."
             )
         if trading.stale_position_grace_seconds <= 0:
             raise ConfigError(

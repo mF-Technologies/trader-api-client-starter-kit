@@ -17,6 +17,8 @@ trading:
   bar_count: 200
   # Print a price heartbeat per symbol without logging every poll or tick.
   price_log_interval_seconds: 30
+  # Confirm owned positions after event notifications and as a low-frequency fallback (min 1s).
+  position_reconcile_seconds: 5
   # Retry paused symbols and restart a failed WebSocket worker after this delay.
   market_data_retry_seconds: 30
   # Allow delayed publication of one completed candle before pausing the instance.
