@@ -7,7 +7,7 @@ import pytest
 
 from trader_api_examples.algo import SignalEvent, StrategyEvaluation
 from trader_api_examples.api import ApiError, Bar
-from trader_api_examples.commands import algo_runner
+from trader_api_examples.commands import _run_position_event_stream, algo_runner
 from trader_api_examples.config import (
     AlgoInstanceConfig,
     AppConfig,
@@ -16,6 +16,7 @@ from trader_api_examples.config import (
     StrategyConfig,
     TradingConfig,
 )
+from trader_api_examples.position_sync import PositionUpdateNotification
 from trader_api_examples.price_client import Quote, QuoteUnavailableError
 from trader_api_examples.runtime import instance_journal_path
 from trader_api_examples.safety import Journal, JournalState
@@ -82,6 +83,34 @@ class ExecutingTraderClient(FakeTraderClient):
         self.liquidate_ids.append(int(kwargs["client_order_id"]))
         self.position_open = False
         return "liquidate-1"
+
+
+class ExternallyClosedTraderClient(ExecutingTraderClient):
+    def __init__(self) -> None:
+        super().__init__()
+        self.position_detail_calls = 0
+
+    async def watch_position_updates(
+        self,
+        queue: asyncio.Queue[PositionUpdateNotification],
+        stop_event: asyncio.Event,
+    ) -> None:
+        while self.add_count == 0 and not stop_event.is_set():
+            await asyncio.sleep(0)
+        if stop_event.is_set():
+            return
+        self.position_open = False
+        await queue.put(
+            PositionUpdateNotification(
+                event_id="external-close",
+                affected_refs=frozenset({"deal-1"}),
+            )
+        )
+        await stop_event.wait()
+
+    async def get_position_detail(self, order_ref: str) -> dict[str, str] | None:
+        self.position_detail_calls += 1
+        return {"dealRef": order_ref} if self.position_open else None
 
 
 class TransientPositionDetailTraderClient(ExecutingTraderClient):
@@ -1194,3 +1223,89 @@ async def test_trade_rejection_disables_only_the_affected_instance(
     assert result.data["instances"]["healthy"]["status"] == "runtime-limit"
     assert client.contract_calls["EURUSD"] > 1
     assert not (tmp_path / "runtime/execution-rejected-gbpusd.json").exists()
+
+
+@pytest.mark.asyncio
+async def test_manual_position_close_is_reconciled_and_runner_continues(
+    tmp_path: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    trading = TradingConfig(
+        contract="EURUSD",
+        amount=1000,
+        max_runtime_seconds=0.05,
+        poll_seconds=0.001,
+        position_reconcile_seconds=1.0,
+    )
+    config = AppConfig(
+        environment="demo",
+        endpoints=EndpointsConfig(
+            web_proxy_url="https://webproxy.example",
+            fxserver_rest_url="https://fxserver.example",
+            chart_server_url="https://chart.example",
+        ),
+        trading=trading,
+        strategy=StrategyConfig(),
+        secrets=Secrets(api_key="api-key", username="user", trade_key="trade-key"),
+        live_trading_enabled=True,
+    )
+    client = ExternallyClosedTraderClient()
+
+    def always_open(*_args: Any, **_kwargs: Any) -> StrategyEvaluation:
+        return StrategyEvaluation(SignalEvent(1, Signal.OPEN_BUY, 50, 1, "rsi"), {"rsi": 50})
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(
+        "trader_api_examples.commands.make_client", lambda *_args, **_kwargs: client
+    )
+    monkeypatch.setattr("trader_api_examples.commands.PriceStreamSession", FakePriceSession)
+    monkeypatch.setattr("trader_api_examples.commands.HeartbeatWriter", lambda: FakeHeartbeat())
+    monkeypatch.setattr("trader_api_examples.commands.evaluate_latest_strategy", always_open)
+
+    result = await algo_runner(config, "live-execute", execute=True)
+
+    log_events = [
+        json.loads(line)["event"]
+        for line in (tmp_path / "runtime/logs/default.jsonl")
+        .read_text(encoding="utf-8")
+        .splitlines()
+    ]
+    assert result.outcome.value == "SUCCESS"
+    assert client.add_count >= 2
+    assert client.liquidate_count == 1
+    assert "POSITION_EXTERNALLY_CLOSED" in log_events
+
+
+@pytest.mark.asyncio
+async def test_position_event_stream_retries_after_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    attempts = 0
+    queue: asyncio.Queue[PositionUpdateNotification] = asyncio.Queue()
+    stop_event = asyncio.Event()
+
+    class FlakyPositionStreamClient:
+        async def watch_position_updates(
+            self,
+            target_queue: asyncio.Queue[PositionUpdateNotification],
+            target_stop_event: asyncio.Event,
+        ) -> None:
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                raise RuntimeError("stream disconnected")
+            await target_queue.put(
+                PositionUpdateNotification(
+                    event_id="recovered",
+                    affected_refs=frozenset({"deal-1"}),
+                )
+            )
+            target_stop_event.set()
+
+    monkeypatch.setattr("trader_api_examples.commands.POSITION_STREAM_RETRY_DELAY_SECONDS", 0.001)
+
+    await _run_position_event_stream(FlakyPositionStreamClient(), queue, stop_event)
+
+    notification = queue.get_nowait()
+    assert attempts == 2
+    assert notification.event_id == "recovered"

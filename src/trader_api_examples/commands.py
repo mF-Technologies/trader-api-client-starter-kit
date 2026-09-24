@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import hashlib
 import json
 import secrets
@@ -25,6 +26,7 @@ from .config import AlgoInstanceConfig, AppConfig
 from .contracts import calculate_amount, find_contract_setting, validate_amount
 from .execution import ExecutionManager, is_retryable_cleanup_error
 from .output import CommandResult
+from .position_sync import PositionUpdateNotification
 from .price_client import PriceStreamSession, Quote, QuoteUnavailableError, read_quote
 from .runtime import HeartbeatWriter, InstanceEventLog, instance_journal_path
 from .safety import (
@@ -34,6 +36,28 @@ from .safety import (
     assert_live_execution_enabled,
 )
 from .strategy import PositionSide, Signal
+
+POSITION_STREAM_RETRY_DELAY_SECONDS = 1.0
+POSITION_STREAM_MAX_RETRY_DELAY_SECONDS = 30.0
+POSITION_RECONCILE_MIN_INTERVAL_SECONDS = 0.05
+
+
+class PositionReconcileThrottle:
+    """Limit shared position reads to the account's 20 requests per second budget."""
+
+    def __init__(self, min_interval: float = POSITION_RECONCILE_MIN_INTERVAL_SECONDS) -> None:
+        self._min_interval = min_interval
+        self._next_allowed_at = 0.0
+        self._lock = asyncio.Lock()
+
+    async def wait(self) -> None:
+        async with self._lock:
+            loop = asyncio.get_running_loop()
+            now = loop.time()
+            delay = max(0.0, self._next_allowed_at - now)
+            self._next_allowed_at = max(now, self._next_allowed_at) + self._min_interval
+        if delay:
+            await asyncio.sleep(delay)
 
 
 def account_fingerprint(api_key: str) -> str:
@@ -107,6 +131,7 @@ class _InstanceRuntime:
     market_data_paused_at: float | None = None
     next_market_data_retry_at: float = 0.0
     next_position_recovery_retry_at: float = 0.0
+    next_position_reconcile_at: float = 0.0
     next_cleanup_retry_at: float = 0.0
     next_price_log_at: float = 0.0
     failure_reason: str | None = None
@@ -470,6 +495,17 @@ def _write_console_status(scope: str, message: str) -> None:
     print(f"[{scope}] {message}", file=sys.stderr, flush=True)
 
 
+def _position_amount(position: dict[str, Any]) -> float | None:
+    value = position.get("amount")
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        amount = float(value)
+    except (TypeError, ValueError):
+        return None
+    return amount if amount > 0 else None
+
+
 def _indicator_summary(indicators: dict[str, float]) -> str:
     if not indicators:
         return "none"
@@ -508,6 +544,112 @@ async def _cleanup_runtime_state(state: _InstanceRuntime, *, execute: bool) -> N
     _write_console_status(f"REST:{state.config.name}", f"Position closed cleanup_ref={cleanup_ref}")
     state.journal = None
     state.owned_side = None
+
+
+async def _reconcile_external_position(
+    state: _InstanceRuntime,
+    *,
+    client: TraderApiClient,
+    throttle: PositionReconcileThrottle,
+    now: float,
+    force: bool = False,
+) -> bool:
+    """Confirm whether an owned position still exists outside the runner.
+
+    Event stream notifications only wake this check. A transient read failure must
+    preserve ownership because clearing the journal would make a real position unsafe.
+    """
+    journal = state.journal
+    if journal is None or not journal.order_ref:
+        return True
+    if not force and now < state.next_position_reconcile_at:
+        return True
+    state.next_position_reconcile_at = now + state.config.trading.position_reconcile_seconds
+    try:
+        await throttle.wait()
+        position = await client.get_position_detail(journal.order_ref)
+    except ApiError as error:
+        if not error.is_transient_response:
+            raise
+        if state.event_log is not None:
+            state.event_log.write(
+                "POSITION_RECONCILIATION_DEFERRED",
+                deal_ref=journal.order_ref,
+                status_code=error.status_code,
+                error_code=error.error_code,
+            )
+        return False
+    if position is not None:
+        current_amount = _position_amount(position)
+        if current_amount is not None and current_amount != journal.amount:
+            previous_amount = journal.amount
+            journal = journal.with_state(journal.state, amount=current_amount)
+            state.journal = journal
+            if state.event_log is not None:
+                state.event_log.write(
+                    "POSITION_EXTERNALLY_MODIFIED",
+                    deal_ref=journal.order_ref,
+                    previous_amount=previous_amount,
+                    current_amount=current_amount,
+                )
+            _write_console_status(
+                f"REST:{state.config.name}",
+                f"External position update confirmed deal_ref={journal.order_ref} "
+                f"amount={current_amount}; local ownership updated.",
+            )
+        return True
+
+    deal_ref = journal.order_ref
+    journal.clear()
+    state.journal = None
+    state.owned_side = None
+    state.status = "external-close-reconciled"
+    state.failure_reason = None
+    if state.event_log is not None:
+        state.event_log.write("POSITION_EXTERNALLY_CLOSED", deal_ref=deal_ref)
+    _write_console_status(
+        f"REST:{state.config.name}",
+        f"External position close confirmed deal_ref={deal_ref}; strategy state reset to FLAT.",
+    )
+    return True
+
+
+async def _run_position_event_stream(
+    client: TraderApiClient,
+    queue: asyncio.Queue[PositionUpdateNotification],
+    stop_event: asyncio.Event,
+) -> None:
+    watch = getattr(client, "watch_position_updates", None)
+    if watch is None:
+        return
+    retry_delay = POSITION_STREAM_RETRY_DELAY_SECONDS
+    try:
+        while not stop_event.is_set():
+            try:
+                await watch(queue, stop_event)
+                if stop_event.is_set():
+                    return
+                _write_console_status(
+                    "Position",
+                    "Position event stream ended; retrying while REST reconciliation "
+                    "remains active.",
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as error:
+                _write_console_status(
+                    "Position",
+                    f"Position event stream unavailable; retrying in {retry_delay:g}s "
+                    f"while REST reconciliation remains active: {error}",
+                )
+            with contextlib.suppress(TimeoutError):
+                await asyncio.wait_for(stop_event.wait(), timeout=retry_delay)
+            retry_delay = min(
+                POSITION_STREAM_MAX_RETRY_DELAY_SECONDS,
+                retry_delay * 2,
+            )
+    except asyncio.CancelledError:
+        raise
 
 
 async def _restore_runtime_state(
@@ -576,6 +718,7 @@ async def _restore_runtime_state(
 
     state.journal = journal
     state.owned_side = PositionSide.LONG if journal.side == "BUY" else PositionSide.SHORT
+    state.next_position_reconcile_at = now + state.config.trading.position_reconcile_seconds
     state.status = "position-restored"
     state.failure_reason = None
     if state.event_log is not None:
@@ -770,6 +913,10 @@ async def algo_runner(config: AppConfig, mode: str, execute: bool) -> CommandRes
         for instance in config.algo_instances
     ]
     heartbeat = HeartbeatWriter()
+    position_update_queue: asyncio.Queue[PositionUpdateNotification] = asyncio.Queue()
+    position_stream_stop = asyncio.Event()
+    position_stream_task: asyncio.Task[None] | None = None
+    position_reconcile_throttle = PositionReconcileThrottle()
 
     _write_console_status(
         "Runner",
@@ -825,11 +972,31 @@ async def algo_runner(config: AppConfig, mode: str, execute: bool) -> CommandRes
 
             async with PriceStreamSession(config) as price_session:
                 _write_console_status("Price", "Shared price session connected")
+                if mode == "live-execute":
+                    _write_console_status("Position", "Shared position event stream connecting")
+                    position_stream_task = asyncio.create_task(
+                        _run_position_event_stream(
+                            client,
+                            position_update_queue,
+                            position_stream_stop,
+                        )
+                    )
                 for state in states:
                     assert state.event_log is not None
                     state.event_log.write("PRICE_SESSION_CONNECTED")
                 try:
+                    pending_position_refs: set[str] = set()
+                    force_position_reconcile = False
                     while any(not state.completed for state in states):
+                        while True:
+                            try:
+                                notification = position_update_queue.get_nowait()
+                            except asyncio.QueueEmpty:
+                                break
+                            if notification.affected_refs:
+                                pending_position_refs.update(notification.affected_refs)
+                            else:
+                                force_position_reconcile = True
                         for state in states:
                             if state.completed:
                                 continue
@@ -861,6 +1028,24 @@ async def algo_runner(config: AppConfig, mode: str, execute: bool) -> CommandRes
                                     continue
                                 state.next_cleanup_retry_at = 0.0
                                 state.status = "cleanup-reconciled"
+                            if state.journal is not None:
+                                deal_ref = state.journal.order_ref
+                                if deal_ref is not None:
+                                    await _reconcile_external_position(
+                                        state,
+                                        client=client,
+                                        throttle=position_reconcile_throttle,
+                                        now=now,
+                                        force=(
+                                            force_position_reconcile
+                                            or deal_ref in pending_position_refs
+                                        ),
+                                    )
+                                    if (
+                                        force_position_reconcile
+                                        or deal_ref in pending_position_refs
+                                    ):
+                                        pending_position_refs.discard(deal_ref)
                             if state.deadline is not None and now >= state.deadline:
                                 if not await _cleanup_or_schedule_retry(
                                     state,
@@ -1113,6 +1298,9 @@ async def algo_runner(config: AppConfig, mode: str, execute: bool) -> CommandRes
                                     f"REST:{instance.name}",
                                     f"Position confirmed deal_ref={state.journal.order_ref}",
                                 )
+                                state.next_position_reconcile_at = (
+                                    loop.time() + instance.trading.position_reconcile_seconds
+                                )
                                 state.status = "position-open"
                             elif state.journal is not None:
                                 if not await _cleanup_or_schedule_retry(
@@ -1128,6 +1316,7 @@ async def algo_runner(config: AppConfig, mode: str, execute: bool) -> CommandRes
                                     "Round trip complete; waiting for the next signal.",
                                 )
 
+                        force_position_reconcile = False
                         heartbeat.write({state.config.name: state.status for state in states})
                         active_polls = [
                             state.config.trading.poll_seconds
@@ -1137,6 +1326,11 @@ async def algo_runner(config: AppConfig, mode: str, execute: bool) -> CommandRes
                         if active_polls:
                             await asyncio.sleep(min(active_polls))
                 finally:
+                    if position_stream_task is not None:
+                        position_stream_stop.set()
+                        position_stream_task.cancel()
+                        with contextlib.suppress(asyncio.CancelledError):
+                            await position_stream_task
                     primary_error = sys.exception()
                     for state in states:
                         if state.journal is not None:

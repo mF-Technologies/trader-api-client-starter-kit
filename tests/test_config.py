@@ -201,6 +201,7 @@ instances:
         ("market_data_retry_seconds", "0"),
         ("bar_stale_grace_seconds", "0"),
         ("price_log_interval_seconds", "0"),
+        ("position_reconcile_seconds", "0.5"),
         ("stale_position_grace_seconds", "0"),
     ],
 )
