@@ -1,3 +1,4 @@
+import asyncio
 from datetime import UTC, datetime
 
 import httpx
@@ -69,6 +70,52 @@ async def test_client_retries_transient_token_exchange_failure(
 
     assert balance == {"balance": 1234.5}
     assert token_exchange_count == 2
+
+
+@pytest.mark.asyncio
+async def test_client_watches_position_update_stream(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    requests: list[httpx.Request] = []
+    monkeypatch.setattr("trader_api_examples.api.POSITION_STREAM_RETRY_DELAY_SECONDS", 0.001)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        assert request.url.path == "/updateEventStream"
+        assert request.headers["Authorization"] == "Bearer fx-token"
+        if len(requests) > 1:
+            assert request.headers["Last-Event-ID"] == "42"
+            return httpx.Response(200, headers={"content-type": "text/event-stream"}, content=b"")
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            content=(b'id: 42\nevent: PositionUpdate\ndata: {"deleted":[5178]}\n\n'),
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+        client = TraderApiClient(
+            web_proxy_url="https://web.example",
+            fxserver_url="https://fx.example",
+            chart_server_url="https://chart.example",
+            api_key="api-key",  # pragma: allowlist secret
+            http_client=http,
+        )
+        client._access_token = "fx-token"
+        queue = asyncio.Queue()
+        stop_event = asyncio.Event()
+        task = asyncio.create_task(client.watch_position_updates(queue, stop_event))
+
+        notification = await asyncio.wait_for(queue.get(), timeout=0.2)
+        for _ in range(100):
+            if len(requests) > 1:
+                break
+            await asyncio.sleep(0.001)
+        stop_event.set()
+        await asyncio.wait_for(task, timeout=0.2)
+
+    assert notification.event_id == "42"
+    assert notification.affected_refs == frozenset({"5178"})
+    assert len(requests) > 1
 
 
 @pytest.mark.asyncio

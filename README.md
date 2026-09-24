@@ -109,6 +109,13 @@ ownership journal and keep that instance in position recovery until the position
 it cannot submit new trades while recovery is pending. Invalid contract amounts and unresolved
 ownership journals stop the worker without automatic restart.
 
+While live execution is running, the worker shares one FxServer `updateEventStream` connection
+for position-change notifications. A notification is confirmed through `positionDetail` before
+the local journal is changed. The worker also checks each owned position every
+`position_reconcile_seconds`, so a terminal-side manual close is reconciled even when the event
+stream reconnects or misses an update. A confirmed external close clears only that instance's
+journal and returns it to `waiting-signal`; it does not stop the other strategies.
+
 Each instance also writes a structured event stream to `runtime/logs/<instance>.jsonl`.
 It records bar evaluations and indicator values, signals, order and liquidation attempts,
 confirmed positions, errors, and shutdown status. Records are flushed immediately and the

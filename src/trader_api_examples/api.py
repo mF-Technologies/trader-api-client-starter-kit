@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import math
 import time
 from dataclasses import dataclass
@@ -8,6 +9,8 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import httpx
+
+from .position_sync import PositionUpdateNotification, SsePositionUpdateParser
 
 
 class ApiError(RuntimeError):
@@ -85,6 +88,8 @@ PERIOD_DURATION = {
 TOKEN_REFRESH_SKEW_SECONDS = 30.0
 TOKEN_EXCHANGE_MAX_ATTEMPTS = 3
 TOKEN_EXCHANGE_RETRY_DELAY_SECONDS = 1.0
+POSITION_STREAM_RETRY_DELAY_SECONDS = 1.0
+POSITION_STREAM_MAX_RETRY_DELAY_SECONDS = 30.0
 
 
 class TraderApiClient:
@@ -155,6 +160,74 @@ class TraderApiClient:
 
     async def _auth_headers(self) -> dict[str, str]:
         return {"Authorization": f"Bearer {await self.access_token()}"}
+
+    async def watch_position_updates(
+        self,
+        queue: asyncio.Queue[PositionUpdateNotification],
+        stop_event: asyncio.Event,
+    ) -> None:
+        """Watch the shared position stream until cancelled or stopped.
+
+        The stream is a notification path only. Callers must confirm any local state
+        change with positionDetail before changing ownership state.
+        """
+        last_event_id: str | None = None
+        retry_delay = POSITION_STREAM_RETRY_DELAY_SECONDS
+        stream_url = f"{self.fxserver_url}/updateEventStream"
+        while not stop_event.is_set():
+            try:
+                headers = await self._auth_headers()
+                headers["Accept"] = "text/event-stream"
+                if last_event_id:
+                    headers["Last-Event-ID"] = last_event_id
+                async with self._http.stream(
+                    "GET",
+                    stream_url,
+                    headers=headers,
+                    timeout=httpx.Timeout(connect=20, read=None, write=20, pool=20),
+                ) as response:
+                    if response.status_code == 401:
+                        self._access_token = ""
+                        self._access_token_expires_at = None
+                        continue
+                    if response.is_error:
+                        await response.aread()
+                        self._raise_for_status(response, "/updateEventStream")
+                    parser = SsePositionUpdateParser()
+                    stream_had_activity = False
+                    async for line in response.aiter_lines():
+                        stream_had_activity = True
+                        if stop_event.is_set():
+                            return
+                        notification = parser.feed_line(line)
+                        if parser.last_event_id:
+                            last_event_id = parser.last_event_id
+                        if notification is not None:
+                            await queue.put(notification)
+                    notification = parser.finish()
+                    if parser.last_event_id:
+                        last_event_id = parser.last_event_id
+                    if notification is not None:
+                        await queue.put(notification)
+                    if stream_had_activity:
+                        retry_delay = POSITION_STREAM_RETRY_DELAY_SECONDS
+            except ApiError as error:
+                if not error.is_transient_response:
+                    raise
+            except httpx.RequestError:
+                pass
+            except httpx.HTTPError:
+                pass
+            await self._wait_for_stream_retry(stop_event, retry_delay)
+            retry_delay = min(
+                POSITION_STREAM_MAX_RETRY_DELAY_SECONDS,
+                retry_delay * 2,
+            )
+
+    @staticmethod
+    async def _wait_for_stream_retry(stop_event: asyncio.Event, delay: float) -> None:
+        with contextlib.suppress(TimeoutError):
+            await asyncio.wait_for(stop_event.wait(), timeout=delay)
 
     async def get_account_balance(self) -> dict[str, Any]:
         response = await self._request(
