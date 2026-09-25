@@ -1,23 +1,24 @@
 # Trader API Examples
 
-Runnable Python reference tools for the mFT Trader API. This repository shows how to
-connect API capabilities into observable workflows; the
-[Developer Platform](https://mf-technologies.github.io/Developers-Platform/) remains the
-source of truth for concepts, authentication, API reference, and first-trade guidance.
+Runnable Python reference tools for the mFT Trader API. The
+[Developer Platform](https://mf-technologies.github.io/Developers-Platform/) is the source
+of truth for authentication, API contracts, concepts, and first-trade guidance.
 
-This repository is private and pre-release. The examples are educational references, not
-investment advice, a profitability claim, or a production trading system.
+These examples are educational references, not investment advice or a production trading
+system.
 
-## Requirements
+## What this repository demonstrates
 
-- Python 3.12
-- Trader API settings and API key from API Key Management
-- Windows 11 for the currently verified local workflow
+- WebProxy API-key exchange and account reads
+- Account-specific live quotes through `fxserverclientpython`
+- Historical bars through Realtime Chart Server
+- Orders, market deals, and liquidations through FxServer REST
+- RSI algo execution with multiple independent instances
 
-Linux and macOS are best effort until they are verified against the mFT package and live
-services.
+## Quick start
 
-## Setup
+Requirements: Python 3.12, a demo account, and connection settings plus an API key from
+API Key Management.
 
 ```powershell
 py -3.12 -m venv .venv
@@ -27,172 +28,71 @@ Copy-Item config.example.yaml config.local.yaml
 Copy-Item .env.local.example .env.local
 ```
 
-Set the demo endpoints and instrument settings in `config.local.yaml`, then add credentials
-to `.env.local`. The application automatically reads `.env.local` from the same directory
-as the selected configuration file. Existing process environment variables take precedence.
-Both local files are ignored by Git.
+Copy the account connection settings into `config.local.yaml`. Put credentials in
+`.env.local`:
 
-## Commands
+```text
+TRADER_API_KEY=<api-key-from-api-key-management>
+TRADER_API_USERNAME=<username-from-api-key-management>
+TRADER_API_TRADE_KEY=<trade-key-from-api-key-management>
+TRADER_API_ENABLE_LIVE_TRADING=false
+```
+
+The REST client exchanges the API key through WebProxy `POST /api/tokens/auth` and uses the
+short-lived access token for FxServer REST. The Python price client receives the API key as
+`valid_generated_token` and handles its supported login; do not replace it with the access
+token.
+
+## Verify the connection
 
 ```powershell
 trader-api-examples account-inspector --config config.local.yaml
-trader-api-examples contract-calculator --config config.local.yaml --lots 0.01
 trader-api-examples market-data-monitor --config config.local.yaml
-trader-api-examples order-lifecycle-checker --config config.local.yaml
+trader-api-examples market-data-monitor --config config.local.yaml --bars-only
+```
+
+For a no-network strategy check:
+
+```powershell
 trader-api-examples rsi-algo-demo --config config.local.yaml --mode replay
-trader-api-examples algo-runner --config config.local.yaml
 ```
 
-Every command supports `--output human` (default) or `--output json`. Logs go to stderr;
-the result goes to stdout.
+## Run an algo
 
-`market-data-monitor` reads both the current quote and completed historical bars. Use
-`--bars-only` when validating Chart Server without opening a price session.
+`algo-runner` shares one live price session, reads completed Chart Server bars, and sends
+trading mutations through FxServer REST. Configure one or more entries under `instances`;
+each entry can select `rsi`, `ema_cross`, `sma_cross`, or `macd`.
 
-## Algo Runner
-
-`algo-runner` is the supported long-running example for customers moving from the earlier
-algo sample. It keeps one FxServer/Price Agent WebSocket session open for all configured
-instances, uses Realtime Chart Server completed bars for signals, and sends every trading
-mutation through FxServer REST.
-
-The built-in strategy modules are independently registered as `rsi`, `ema_cross`,
-`sma_cross`, and `macd`. Each instance selects one strategy by name, so strategy logic can be
-tested, replaced, or packaged without changing the shared market-data and REST execution
-runner. RSI is the v1 live-verified strategy. The moving-average and MACD modules have
-offline tests but are reference implementations until they complete separate live validation.
-The registry is an extension boundary for future strategy packages; it is not an external
-marketplace or third-party loader yet.
-
-Add an `instances` list to `config.local.yaml` to run strategies against different contracts
-through the shared price session. Each instance has its own position state and recovery
-journal. When `instances` is omitted, the shared `trading` and `strategy` sections define
-one `default` instance.
-
-For example, an instance can choose a moving-average strategy without changing the runner:
-
-```yaml
-instances:
-  - name: euro-ema
-    trading:
-      contract: EURUSD
-      amount: 1000
-    strategy:
-      name: ema_cross
-      fast_period: 12
-      slow_period: 26
-```
-
-The default `live-observe` mode streams account-specific quotes and evaluates signals but
-does not trade:
+Observe signals without trading:
 
 ```powershell
 trader-api-examples algo-runner --config config.local.yaml
 ```
 
-The runner evaluates each completed bar once and writes `runtime/algo-heartbeat.json` for
-external health monitoring. By default it runs until interrupted; set
-`max_runtime_seconds` to a positive value only when a bounded QA run is required. `bar_count`
-controls the completed-candle history used for indicator warm-up, while `poll_seconds` controls
-how often the runner checks quotes and completed bars. Stale quotes, stale bars, or insufficient
-historical bars pause only the affected instance and block new entries while healthy instances
-continue. A completed bar is considered stale only after two bar periods plus
-`bar_stale_grace_seconds`; this allows a short publication delay without trading on an old bar.
-The paused instance retries market data every `market_data_retry_seconds` and
-automatically resumes after valid data returns. If it owns a position and data remains unavailable for
-`stale_position_grace_seconds`, the runner closes that position through REST and continues
-retrying market data. Temporary `934` liquidation failures retain the ownership journal and
-retry only the affected instance. Transient ChartServer and chart-code HTTP failures (`408`,
-`425`, `429`, and `5xx`) follow the same per-instance retry path; chart-code mappings are
-cached for the worker lifetime. Transient `positionDetail` failures during startup retain the
-ownership journal and keep that instance in position recovery until the position is confirmed;
-it cannot submit new trades while recovery is pending. Invalid contract amounts and unresolved
-ownership journals stop the worker without automatic restart.
-
-While live execution is running, the worker shares one FxServer `updateEventStream` connection
-for position-change notifications. A notification is confirmed through `positionDetail` before
-the local journal is changed. The worker also checks each owned position every
-`position_reconcile_seconds`, so a terminal-side manual close is reconciled even when the event
-stream reconnects or misses an update. A confirmed external close clears only that instance's
-journal and returns it to `waiting-signal`; it does not stop the other strategies.
-
-Each instance also writes a structured event stream to `runtime/logs/<instance>.jsonl`.
-It records bar evaluations and indicator values, signals, order and liquidation attempts,
-confirmed positions, errors, and shutdown status. Records are flushed immediately and the
-files rotate at 10 MB with five backups. Credentials, tokens, and full price tags are never
-included. These diagnostic logs are separate from the temporary ownership journals used
-for recovery.
-
-With `fxserverclientpython` 0.1.10, the WebSocket client is process-scoped. The default
-`algo-runner` command therefore supervises a child worker. When the shared FxServer or Price
-Agent transport becomes unhealthy, the worker exits, retains any unresolved ownership
-journals, and is restarted after `market_data_retry_seconds`. The new worker creates a fresh
-WebSocket session and reconciles each journal before strategy evaluation resumes. It does not
-call the package's unstable logout path or reconnect inside the failed process.
-
-## RSI Replay Demo
-
-The demo uses TA-Lib RSI(14) over completed Realtime Chart Server bars:
-
-- Open long when RSI crosses upward out of oversold (`<30` to `>=30`).
-- Open short when RSI crosses downward out of overbought (`>70` to `<=70`).
-- Close long or short when RSI crosses the neutral level (`50`) in the exit direction.
-- Hold at most one owned position and complete at most one round trip per run.
-- Do not average, martingale, repeat while inside a zone, or relax thresholds to create a signal.
-
-Modes retained by this focused RSI command:
-
-- `replay`: synthetic fixture, no network, no trading; this is the default.
-- `live-observe`: live completed bars and proposed actions, no trading.
-- `live-execute`: live bars plus real Trader API mutations.
-
-Use `algo-runner` for the shared Price Agent session and multi-strategy workflow.
-
-`NO_SIGNAL` is a normal result. Missing, malformed, stale, or interrupted market data is
-`INCONCLUSIVE` instead.
-
-## Live Execution
-
-Live execution is demo-first but technically compatible with eligible real accounts. Only
-the demo workflow is verified for v1. Real-account use involves real financial risk and is
-not an officially verified v1 workflow.
-
-Both gates are required before any mutation:
+Replay is the default for `rsi-algo-demo`. Live execution requires both gates:
 
 ```powershell
 $env:TRADER_API_ENABLE_LIVE_TRADING = "true"
 trader-api-examples algo-runner --config config.local.yaml --mode live-execute --execute
 ```
 
-Before submitting, the tool displays a redacted account fingerprint, environment,
-contract, side, and amount. It persists a minimal ignored recovery journal before sending
-`addDeal`. The tool only closes positions whose ownership it can establish. Unrelated
-positions produce a warning; unresolved or ambiguous ownership blocks new submissions.
-On restart, `algo-runner` restores a confirmed open position from its per-instance journal.
-If shutdown was interrupted during cleanup, it retries that cleanup with the persisted
-intent before resuming the strategy. Temporary `710` or `934` cleanup rejections keep only
-that instance in `cleanup-pending`; the position remains tracked and cleanup is retried while
-other instances continue. A `409 DUPLICATE_CLIENT_ORDER_ID` during cleanup is reconciled by
-checking whether the owned position has disappeared; the runner retains the same client order
-id and never submits a new liquidation request for that ambiguous attempt. It never adopts an
-account position without a matching ownership journal.
+Use a demo environment first. The runner writes per-instance logs and recovery journals
+under `runtime/`; keep those files private because they can contain account and trade state.
 
-The current API prevents duplicate requests with `clientOrderId`, but the current query
-contracts do not expose a reliable `clientOrderId` correlation. When a submission outcome
-is ambiguous, the tool reconciles read-only order and position state using the client order
-id when available, otherwise an exact contract/side/amount match that excludes positions
-seen before submission. It adopts a reference only when the match is unique and the
-position detail is confirmed; ambiguous ownership retains the journal and blocks that
-instance until it can be reconciled.
+## Phase 1 request flow
 
-## Scope
+1. Create an API key with `read` and, when needed, `trade` permission in API Key Management.
+2. Use the supplied connection settings and API key in the local files.
+3. Use `fxserverclientpython` for live bid/ask prices and price tags.
+4. Resolve contract to chart code with FxServer, then request completed bars from ChartServer.
+5. Use FxServer REST for account reads, orders, deals, and liquidations.
+6. Use `GET /updateEventStream` for asynchronous notifications and confirm state with REST.
 
-The examples cover WebProxy token exchange/account state, a shared account-specific price
-session, FxServer Trader REST execution, Realtime Chart Server completed bars, contract
-amount calculation, RSI/MACD/EMA Cross signals, multi-instance orchestration, heartbeat,
-and owned-position recovery. They do not cover Terminal UI automation, CRM, payments,
-PAMM, MT5, service installation, process auto-restart, a strategy marketplace, or
-production operations.
+Read the public guides for the complete request and response schemas:
 
-See [SUPPORT.md](SUPPORT.md) for issue routing and [SECURITY.md](SECURITY.md) before sharing
-diagnostics.
+- [Make your first trade](https://mf-technologies.github.io/Developers-Platform/docs/getting-started/first-trade)
+- [Get live prices](https://mf-technologies.github.io/Developers-Platform/docs/getting-started/get-prices)
+- [FxServer Trader API](https://mf-technologies.github.io/Developers-Platform/docs/fx-server/openapi-trader)
+- [Realtime Chart Server](https://mf-technologies.github.io/Developers-Platform/docs/realtime-chart-server/overview)
+
+See [SECURITY.md](SECURITY.md) before sharing logs or diagnostics.
