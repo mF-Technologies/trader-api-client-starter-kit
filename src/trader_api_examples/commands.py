@@ -316,6 +316,33 @@ def _stale_threshold_seconds(period_type: int, grace_seconds: float) -> float:
     return PERIOD_DURATION[period_type].total_seconds() * 2 + grace_seconds
 
 
+def _contiguous_bar_suffix(
+    bars: list[Bar], period_type: int
+) -> tuple[list[Bar], tuple[int, int] | None]:
+    """Return the latest contiguous bars and the first newer-than-expected gap."""
+    if not bars:
+        return [], None
+    expected_ms = int(PERIOD_DURATION[period_type].total_seconds() * 1000)
+    suffix = [bars[-1]]
+    gap: tuple[int, int] | None = None
+    for previous, current in zip(reversed(bars[:-1]), reversed(bars[1:]), strict=True):
+        if current.time_ms - previous.time_ms > expected_ms:
+            gap = (previous.time_ms, current.time_ms)
+            break
+        suffix.append(previous)
+    suffix.reverse()
+    return suffix, gap
+
+
+def _bar_gap_message(instance_name: str, gap: tuple[int, int], contiguous_count: int) -> str:
+    previous_time_ms, current_time_ms = gap
+    return (
+        f"Completed market data has a gap for {instance_name}: "
+        f"previous_time_ms={previous_time_ms} current_time_ms={current_time_ms}; "
+        f"only {contiguous_count} contiguous bars are available."
+    )
+
+
 async def live_algo(config: AppConfig, mode: str, execute: bool) -> CommandResult:
     if mode == "live-execute":
         assert_live_execution_enabled(enabled=config.live_trading_enabled, execute=execute)
@@ -358,6 +385,21 @@ async def live_algo(config: AppConfig, mode: str, execute: bool) -> CommandResul
                         "rsi-algo-demo",
                         Outcome.INCONCLUSIVE,
                         "Completed market data is stale or missing.",
+                        {"mode": mode},
+                    )
+                bars, gap = _contiguous_bar_suffix(bars, config.strategy.period_type)
+                if gap is not None and len(bars) < required_completed_bars(config.strategy):
+                    return CommandResult(
+                        "rsi-algo-demo",
+                        Outcome.INCONCLUSIVE,
+                        _bar_gap_message("default", gap, len(bars)),
+                        {"mode": mode},
+                    )
+                if len(bars) < required_completed_bars(config.strategy):
+                    return CommandResult(
+                        "rsi-algo-demo",
+                        Outcome.INCONCLUSIVE,
+                        "Not enough completed bars for the configured strategy.",
                         {"mode": mode},
                     )
                 if bars[-1].time_ms == last_bar_time:
@@ -1149,6 +1191,18 @@ async def algo_runner(config: AppConfig, mode: str, execute: bool) -> CommandRes
                                         "Completed market data is stale or missing for "
                                         f"{instance.name} ({freshness})."
                                     ),
+                                    execute=execute,
+                                    now=loop.time(),
+                                )
+                                continue
+                            bars, gap = _contiguous_bar_suffix(bars, instance.strategy.period_type)
+                            if gap is not None and len(bars) < required_completed_bars(
+                                instance.strategy
+                            ):
+                                await _pause_runtime_state(
+                                    state,
+                                    status="bar-gap",
+                                    message=_bar_gap_message(instance.name, gap, len(bars)),
                                     execute=execute,
                                     now=loop.time(),
                                 )

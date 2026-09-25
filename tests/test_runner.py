@@ -167,6 +167,24 @@ class RecoveringChartServerClient(FakeTraderClient):
         return [Bar(time_ms=time_ms, open=1, high=1, low=1, close=1)] * 40
 
 
+class GapBarTraderClient(FakeTraderClient):
+    def __init__(self) -> None:
+        super().__init__()
+        self.contract_calls: dict[str, int] = {}
+
+    async def get_completed_bars(self, **kwargs: Any) -> list[Bar]:
+        contract = str(kwargs["contract"])
+        self.contract_calls[contract] = self.contract_calls.get(contract, 0) + 1
+        now_ms = int(datetime.now(UTC).timestamp() * 1000)
+        if contract != "GBPUSD":
+            return [Bar(time_ms=now_ms, open=1, high=1, low=1, close=1)] * 40
+        times = [
+            now_ms - 60_000 * offset
+            for offset in (20, 19, 18, 17, 16, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1)
+        ]
+        return [Bar(time_ms=time_ms, open=1, high=1, low=1, close=1) for time_ms in times]
+
+
 class StaleAfterOpenTraderClient(ExecutingTraderClient):
     async def get_completed_bars(self, **_: Any) -> list[Bar]:
         self.bar_calls += 1
@@ -405,6 +423,61 @@ async def test_stale_bars_pause_only_the_affected_instance(
     assert result.data["instances"]["stale"]["status"] == "stale-bars"
     assert client.contract_calls["EURUSD"] > 1
     assert client.contract_calls["GBPUSD"] > 1
+
+
+@pytest.mark.asyncio
+async def test_bar_gap_pauses_only_the_affected_instance(
+    tmp_path: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    trading = TradingConfig(
+        contract="EURUSD",
+        amount=1000,
+        max_runtime_seconds=0.02,
+        poll_seconds=0.001,
+        market_data_retry_seconds=0.001,
+        bar_stale_grace_seconds=60,
+    )
+    config = AppConfig(
+        environment="demo",
+        endpoints=EndpointsConfig(
+            web_proxy_url="https://webproxy.example",
+            fxserver_rest_url="https://fxserver.example",
+            chart_server_url="https://chart.example",
+        ),
+        trading=trading,
+        strategy=StrategyConfig(),
+        instances=(
+            AlgoInstanceConfig("healthy", trading, StrategyConfig()),
+            AlgoInstanceConfig(
+                "gap",
+                TradingConfig(
+                    contract="GBPUSD",
+                    amount=1000,
+                    max_runtime_seconds=0.02,
+                    poll_seconds=0.001,
+                    market_data_retry_seconds=0.001,
+                    bar_stale_grace_seconds=60,
+                ),
+                StrategyConfig(),
+            ),
+        ),
+        secrets=Secrets(api_key="api-key", username="user", trade_key="trade-key"),
+    )
+    client = GapBarTraderClient()
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(
+        "trader_api_examples.commands.make_client", lambda *_args, **_kwargs: client
+    )
+    monkeypatch.setattr("trader_api_examples.commands.PriceStreamSession", FakePriceSession)
+    monkeypatch.setattr("trader_api_examples.commands.HeartbeatWriter", lambda: FakeHeartbeat())
+
+    result = await algo_runner(config, "live-observe", execute=False)
+
+    assert result.data["instances"]["healthy"]["status"] == "runtime-limit"
+    assert result.data["instances"]["gap"]["status"] == "bar-gap"
+    assert result.data["instances"]["gap"]["events"] == []
 
 
 @pytest.mark.asyncio

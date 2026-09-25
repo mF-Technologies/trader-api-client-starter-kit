@@ -189,6 +189,11 @@ class TraderApiClient:
                     if response.status_code == 401:
                         self._access_token = ""
                         self._access_token_expires_at = None
+                        await self._wait_for_stream_retry(stop_event, retry_delay)
+                        retry_delay = min(
+                            POSITION_STREAM_MAX_RETRY_DELAY_SECONDS,
+                            retry_delay * 2,
+                        )
                         continue
                     if response.is_error:
                         await response.aread()
