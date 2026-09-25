@@ -200,6 +200,10 @@ class PriceStreamSession:
         self._raise_background_error()
         if self._client is None:
             await self.connect()
+        if self._price_listener_id is None:
+            raise PriceTransportError(
+                "Price update listener is unavailable; refusing cached quote."
+            )
         deadline = asyncio.get_running_loop().time() + timeout_seconds
         while asyncio.get_running_loop().time() < deadline:
             self._raise_background_error()
@@ -218,8 +222,7 @@ class PriceStreamSession:
                 raise PriceTransportError(
                     "Shared price stream stopped updating; restart the process."
                 )
-            listener_has_seen_contract = self._price_listener_id is None or last_update is not None
-            if price is not None and listener_has_seen_contract:
+            if price is not None and last_update is not None:
                 return Quote(
                     contract=contract,
                     bid=float(price.bid),

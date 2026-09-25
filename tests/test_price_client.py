@@ -37,6 +37,13 @@ class FakePriceClient:
     async def logout(self) -> None:
         self.logout_count += 1
 
+    def add_price_listener(self, callback: Any) -> str:
+        callback(PriceEvent(list(self.prices)))
+        return "listener-1"
+
+    def remove_price_listener(self, _: str) -> None:
+        return None
+
     def get_price_info(self, contract: str) -> Any:
         return self.prices.get(contract)
 
@@ -203,13 +210,13 @@ async def test_price_session_restarts_when_shared_stream_stops_updating() -> Non
 
 
 @pytest.mark.asyncio
-async def test_price_session_falls_back_to_polling_when_listener_registration_fails() -> None:
+async def test_price_session_fails_closed_when_listener_registration_fails() -> None:
     client = ListenerFailingPriceClient()
 
-    async with PriceStreamSession(price_config(), client_factory=lambda: client) as session:
-        quote = await session.get_quote("LLG", timeout_seconds=0.1)
+    with pytest.raises(PriceTransportError, match="listener is unavailable"):
+        async with PriceStreamSession(price_config(), client_factory=lambda: client) as session:
+            await session.get_quote("LLG", timeout_seconds=0.1)
 
-    assert quote.bid == 4000
     assert client.logout_count == 0
 
 

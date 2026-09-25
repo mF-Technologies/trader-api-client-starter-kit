@@ -119,6 +119,41 @@ async def test_client_watches_position_update_stream(
 
 
 @pytest.mark.asyncio
+async def test_position_update_stream_backs_off_after_repeated_unauthorized(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    requests = 0
+    stop_event = asyncio.Event()
+    monkeypatch.setattr("trader_api_examples.api.POSITION_STREAM_RETRY_DELAY_SECONDS", 0.001)
+    monkeypatch.setattr("trader_api_examples.api.POSITION_STREAM_MAX_RETRY_DELAY_SECONDS", 0.002)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal requests
+        assert request.url.path == "/updateEventStream"
+        requests += 1
+        if requests >= 3:
+            stop_event.set()
+        return httpx.Response(401, json={"msg": "Unauthorized"})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+        client = TraderApiClient(
+            web_proxy_url="https://web.example",
+            fxserver_url="https://fx.example",
+            chart_server_url="https://chart.example",
+            api_key="api-key",  # pragma: allowlist secret
+            http_client=http,
+        )
+
+        async def auth_headers() -> dict[str, str]:
+            return {"Authorization": "Bearer expired-token"}
+
+        client._auth_headers = auth_headers  # type: ignore[method-assign]
+        await asyncio.wait_for(client.watch_position_updates(asyncio.Queue(), stop_event), 0.2)
+
+    assert requests == 3
+
+
+@pytest.mark.asyncio
 async def test_client_retries_token_exchange_transport_failure(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
