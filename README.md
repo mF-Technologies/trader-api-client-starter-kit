@@ -96,3 +96,7 @@ Read the public guides for the complete request and response schemas:
 - [Realtime Chart Server](https://mf-technologies.github.io/Developers-Platform/docs/realtime-chart-server/overview)
 
 See [SECURITY.md](SECURITY.md) before sharing logs or diagnostics.
+
+## License
+
+This repository is licensed under the Apache License 2.0. See [LICENSE](LICENSE).
