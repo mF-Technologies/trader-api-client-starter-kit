@@ -21,4 +21,6 @@ an issue. Use synthetic or fully redacted reproduction data.
 ## Reporting
 
 Do not open a public issue for a suspected credential exposure or exploitable API defect.
-Use the private security channel provided by mF Technologies.
+Report vulnerabilities privately through [GitHub private vulnerability reporting](
+https://github.com/mF-Technologies/trader-api-examples/security/advisories/new).
+Do not include credentials, customer data, or unredacted account responses in the report.
