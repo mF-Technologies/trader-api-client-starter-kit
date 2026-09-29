@@ -1,7 +1,8 @@
 # Contributing
 
-External feedback and reproducible issues are welcome during the private phase. Official
-example code remains maintainer-controlled.
+External feedback and reproducible issues are welcome. This repository contains public
+reference code, while official example changes remain maintainer-controlled and require
+maintainer review.
 
 Before proposing a change:
 
@@ -11,5 +12,5 @@ Before proposing a change:
 4. Run `python -m ruff check .`, `python -m mypy`, and `python -m pytest`.
 5. Do not add credentials, customer data, environment dumps, or real trade artifacts.
 
-Public release, licensing, and third-party contribution terms require a separate human
-legal and product approval.
+The repository is licensed under Apache-2.0. Third-party contributions require maintainer
+approval and must be compatible with this license.
