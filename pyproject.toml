@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "trader-api-examples"
 version = "0.1.0"
-description = "Runnable reference tools and guarded algo examples for the mFT Trader API."
+description = "Runnable Python client starter kit for the mFT Trader API."
 readme = "README.md"
 license = {file = "LICENSE"}
 requires-python = ">=3.12,<3.15"

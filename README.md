@@ -1,11 +1,11 @@
-# Trader API Examples
+# Trader API Client Starter Kit
 
-Runnable Python reference tools for the mFT Trader API. The
+Runnable Python starter kit for building mFT Trader API integrations. The
 [Developer Platform](https://mf-technologies.github.io/Developers-Platform/) is the source
 of truth for authentication, API contracts, concepts, and first-trade guidance.
 
-These examples are educational references, not investment advice or a production trading
-system.
+This is a runnable reference implementation and starting point, not investment advice or a
+production trading system.
 
 ## What this repository demonstrates
 

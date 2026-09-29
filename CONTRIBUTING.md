@@ -1,7 +1,7 @@
 # Contributing
 
 External feedback and reproducible issues are welcome. This repository contains public
-reference code, while official example changes remain maintainer-controlled and require
+reference code, while official starter-kit changes remain maintainer-controlled and require
 maintainer review.
 
 Before proposing a change:
